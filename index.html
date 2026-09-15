@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mosquito V5.8 Master</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main>
+  <header><div class="bug">$</div><div><h1>MOSQUITO</h1><p>V5.8 MASTER</p></div></header>
+  <section class="hero"><span id="mode">PAPER PREVIEW</span><h2>Sucking the profit<br>out of the market.</h2>
+    <div class="stats"><div><small>STRATEGY</small><b>Top 50</b></div><div><small>WEIGHT</small><b>Equal</b></div><div><small>UNIVERSE</small><b>AI Only</b></div></div>
+  </section>
+  <section class="controls"><button class="go" onclick="scan(50)">GO · LOAD 50</button><button onclick="scan(25)">VIEW 25</button><button class="stop" onclick="stopBot()">STOP</button></section>
+  <p id="message">Ready to generate the next V5.8 Master watchlist.</p>
+  <section class="card"><div class="cardhead"><h3>V5.8 WATCHLIST</h3><span id="gate">—</span></div><div id="picks" class="picks"></div></section>
+  <footer>Research and Alpaca paper-preview only · Fidelity eligibility must be verified</footer>
+</main><script>
+async function scan(count){const m=document.getElementById('message');m.textContent='Scanning market data…';document.getElementById('picks').innerHTML='';
+ try{const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count})});const d=await r.json();if(!r.ok)throw Error(d.error||'Scan failed');
+ m.textContent=`Generated ${d.count} picks · ${new Date(d.generated_at).toLocaleString()}`;document.getElementById('gate').textContent=d.april_trade_allowed?'SIGNAL: GO':'APRIL GATE: STOP';
+ document.getElementById('picks').innerHTML=d.picks.map(x=>`<div><b>${x.rank}</b><strong>${x.ticker}</strong><span>${x.score}</span><small>${x.weight_pct}%</small></div>`).join('');}catch(e){m.textContent=e.message}}
+function stopBot(){document.getElementById('message').textContent='Stopped. No orders are being submitted.';document.getElementById('gate').textContent='STOPPED'}
+</script></body></html>
