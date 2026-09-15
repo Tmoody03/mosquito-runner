@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir Flask==3.1.2 gunicorn==23.0.0 numpy==2.3.3 pandas==2.3.2 yfinance==0.2.65 alpaca-py==0.42.2
 
-RUN phthon - <<'PY'
+RUN python - <<'PY'
 from pathlib import Path
 
 Path('/app/app.py').write_text(r'''import os
