@@ -7,6 +7,7 @@ paper/live boundary explicit at one small interface.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -90,6 +91,16 @@ class Lifecycle:
     def _client_id(self, purpose, symbol, generation=0):
         # Stable across process restarts and retries within a market session.
         day = self._now().date().isoformat().replace("-", "")
+        if purpose == "entry":
+            # A reset clears Mosquito's local lifecycle state, not Alpaca's
+            # historical client-order IDs. Namespace new entry IDs so a same-day
+            # reset cannot be rejected as a duplicate while retries stay stable.
+            namespace = (os.getenv("MOSQUITO_ORDER_NAMESPACE") or
+                         os.getenv("MOSQUITO_RESET_ID") or "default")
+            digest = hashlib.sha256(
+                f"{namespace}:{generation}".encode("utf-8")
+            ).hexdigest()[:6]
+            return f"mosquito-v58-{purpose}-{day}-{symbol}-{digest}"
         return f"mosquito-v58-{purpose}-{day}-{symbol}-{generation}"
 
     def _submit_once(self, state, *, symbol, notional, purpose, generation=0):
