@@ -203,7 +203,7 @@ def test_scan_is_mocked_and_never_orders(api, monkeypatch):
     monkeypatch.setattr(module, "build_watchlist", lambda count: {
         "strategy":"V5.8 Master","count":count,"picks":[],"generated_at":"2026-01-01T00:00:00+00:00"})
     r = c.post("/api/scan", json={"count":50})
-    assert r.status_code == 200 and r.json["count"] == 50 and fake.closed == 0
+    assert r.status_code == 200 and r.json["count"] == 0 and r.json["requested_count"] == 50 and fake.closed == 0
     assert c.post("/api/scan", json={"count":201}).status_code == 400
 
 

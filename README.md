@@ -102,3 +102,12 @@ Current restart limitation: the persisted `running` flag survives a restart,
 but the in-process monitor is started by the Start Bot action. Until automatic
 worker-start initialization is implemented and tested in `app.py`, press Start
 Bot once after each Railway restart before relying on trailing monitoring.
+
+## Teddy Fundamental Gate
+
+Every published or tradable pick must first pass the fail-closed rules in
+`TRADING_RULES.md`. Mosquito reads recent SEC company facts and filings to
+require positive net assets/equity, debt coverage by cash or a clear asset
+cushion, and positive backlog/order-book/RPO evidence. Missing evidence is a
+failure; momentum cannot override it. Results are cached on the persistent
+volume and attached to selected dashboard rows for auditability.

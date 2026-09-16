@@ -7,6 +7,7 @@ from functools import wraps
 from pathlib import Path
 from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
 from strategy import AI_UNIVERSE,build_watchlist,rank_watchlist
+from fundamentals import screen_ranked
 import simulator
 import engine
 from protection import protected_state
@@ -189,10 +190,18 @@ def tradable_picks(broker,count=50):
     assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
     tradable={str(getattr(a,"symbol","")).upper() for a in assets if bool(getattr(a,"tradable",False)) and bool(getattr(a,"fractionable",False))}
     candidates=[symbol for symbol in AI_UNIVERSE if symbol in tradable];close,volume=alpaca_history(candidates);watch=rank_watchlist(close,volume,len(candidates),source="alpaca_daily_bars_full_universe")
-    picks=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
+    ranked=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
+    picks=screen_ranked(ranked,required=count)
     if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
     return picks
+
+def fundamental_research_watchlist(count=50):
+    """Rank all six-month candidates, then publish only fundamental passes."""
+    watch=build_watchlist(len(AI_UNIVERSE));picks=screen_ranked(watch.get("picks",[]),required=count)
+    watch.update(picks=picks,count=len(picks),requested_count=count,qualified_count=len(picks),fundamental_gate="PASS_REQUIRED",
+                 notice=watch.get("notice","")+" SEC balance-sheet and backlog gate applied; missing evidence fails closed.")
+    return watch
 
 def qualifying_universe_picks(broker, limit=50, ranked=None):
     """Rank the eligible AI universe, then apply today's live entry gate.
@@ -289,14 +298,14 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     locked=list(state.get("selected_watchlist") or [])
     candidate_pool=list(state.get("selection_universe") or [])
     if state.get("selection_session")!=session_date:
-        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in tradable_picks(broker,len(AI_UNIVERSE))]
+        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible","fundamental_gate","fundamentals")} for row in tradable_picks(broker,len(AI_UNIVERSE))]
         candidates_by_symbol={str(row.get("ticker")):row for row in candidate_pool}
         locked=[dict(candidates_by_symbol[symbol]) for symbol in occupied if symbol in candidates_by_symbol]
     elif not candidate_pool:
         # Migrate the pre-full-universe state safely. With no broker exposure,
         # discard the old pre-gated 50 so qualified lower-ranked names can enter.
         if not occupied:locked=[]
-        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in tradable_picks(broker,50)]
+        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible","fundamental_gate","fundamentals")} for row in tradable_picks(broker,50)]
     live_qualified=qualifying_universe_picks(broker,50,ranked=candidate_pool)
     # Preserve already selected/ordered symbols and append newly qualified names
     # in V5.8 rank order until the equal-weight Top 50 is full.
@@ -596,7 +605,7 @@ def scan():
     try:
         count=int((request.get_json(silent=True) or {}).get("count",50))
         if not 1<=count<=200:raise ValueError
-        r=cached(f"scan:{count}",300,lambda:build_watchlist(count));s=load_state();s.update(last_scan=r.get("generated_at",now()),last_error=None);save_state(s);return jsonify(r)
+        r=cached(f"scan:{count}",300,lambda:fundamental_research_watchlist(count));s=load_state();s.update(last_scan=r.get("generated_at",now()),last_error=None);save_state(s);return jsonify(r)
     except (TypeError,ValueError):return error("count must be an integer from 1 through 200")
     except Exception as exc:
         s=load_state();s["last_error"]="Market scan unavailable";save_state(s);app.logger.warning("scan failure: %s",type(exc).__name__);return error("Market scan is temporarily unavailable",503)
