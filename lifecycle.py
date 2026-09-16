@@ -168,7 +168,10 @@ class Lifecycle:
             if slots <= 0 or available < 1:
                 break
             symbol = row["symbol"]
-            if symbol in occupied:
+            # A verified round trip is retired for this staged launch. Re-entry
+            # belongs to the cooldown/baseline rebalance path, not a duplicate
+            # generation-zero order in the same scheduler cycle.
+            if symbol in occupied or symbol in state["retired"]:
                 continue
             notional = min(weight, available)
             self._submit_once(state, symbol=symbol, notional=notional, purpose="entry")
