@@ -107,7 +107,7 @@ class Lifecycle:
             namespace = (os.getenv("MOSQUITO_ORDER_NAMESPACE") or
                          os.getenv("MOSQUITO_RESET_ID") or "default")
             digest = hashlib.sha256(
-                f"{namespace}:{generation}".encode("utf-8")
+                f"{namespace}:{self.STRATEGY_REVISION}:{generation}".encode("utf-8")
             ).hexdigest()[:6]
             return f"mosquito-v58-{purpose}-{day}-{symbol}-{digest}"
         return f"mosquito-v58-{purpose}-{day}-{symbol}-{generation}"
