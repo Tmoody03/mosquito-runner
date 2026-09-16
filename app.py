@@ -153,8 +153,8 @@ def confirmed_entry_picks(picks):
     if threshold<0 or threshold>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
     rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
     symbols=list(rows)
-    for offset in range(0,len(symbols),60):
-        batch=symbols[offset:offset+60]
+    for offset in range(0,len(symbols),20):
+        batch=symbols[offset:offset+20]
         snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
         for symbol in batch:
             snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None)
