@@ -11,7 +11,7 @@ import simulator
 import engine
 from protection import protected_state
 from lifecycle import Lifecycle
-from scheduler import MarketScheduler
+from scheduler import MarketScheduler,RetryPending
 
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
 LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
@@ -153,11 +153,18 @@ def confirmed_entry_picks(picks):
     if threshold<0 or threshold>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
     rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
     symbols=list(rows)
-    for offset in range(0,len(symbols),20):
-        batch=symbols[offset:offset+20]
-        try:snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
+    def snapshots_for(batch):
+        """Isolate a bad/unavailable symbol instead of blocking the other 49."""
+        try:
+            return market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
         except Exception as exc:
-            log_broker_error(exc,"entry_snapshot_batch","/v2/stocks/snapshots");continue
+            log_broker_error(exc,"entry_snapshot",f"symbols={len(batch)}")
+            if len(batch)<=1:return {}
+            middle=len(batch)//2
+            return {**snapshots_for(batch[:middle]),**snapshots_for(batch[middle:])}
+    for offset in range(0,len(symbols),10):
+        batch=symbols[offset:offset+10]
+        snapshots=snapshots_for(batch)
         for symbol in batch:
             snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None)
             opened=number(getattr(bar,"open",None));current=number(getattr(trade,"price",None));stamp=getattr(trade,"timestamp",None)
@@ -203,7 +210,7 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
         result=life.enter_available(confirmed,bp,total_budget=allocation)
         occupied=set(result.get("positions",{}))|{o.get("symbol") for o in result.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
         state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
-        if len(occupied)<50:raise RuntimeError(f"Entry gate waiting: {len(occupied)}/50 locked picks have paper positions or pending orders")
+        if len(occupied)<50:raise RetryPending(f"Entry gate waiting: {len(occupied)}/50 locked picks have paper positions or pending orders")
     else:
         selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
         result=life.rebalance(confirmed,prices,bp,dead_symbols=dead)
