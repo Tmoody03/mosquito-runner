@@ -16,6 +16,8 @@ class FakeClient:
             portfolio_value="10000", equity="10000", last_equity="9900", buying_power="12000",
             daytrading_buying_power="12000", regt_buying_power="12000", trading_blocked=False,
             transfers_blocked=False, account_blocked=False, pattern_day_trader=False, daytrade_count=0)
+    def get_clock(self):
+        return SimpleNamespace(is_open=False)
     def get_all_positions(self):
         return [SimpleNamespace(asset_id="a",symbol="NVDA",exchange="NASDAQ",asset_class="us_equity",
             qty="2",side="long",market_value="300",cost_basis="250",avg_entry_price="125",unrealized_pl="50",
@@ -43,6 +45,7 @@ def api(tmp_path, monkeypatch):
     sys.modules.pop("app", None)
     module = importlib.import_module("app")
     module.CACHE.clear(); module.CALLS.clear(); module.EXIT_RESULTS.clear()
+    module.BROKER_HEALTH_CACHE=None;module.BROKER_HEALTH_EXPIRES=0;module.BROKER_HEALTH_FUTURE=None
     fake = FakeClient()
     monkeypatch.setattr(module, "client", lambda: fake)
     module.app.config.update(TESTING=True)
@@ -60,6 +63,32 @@ def test_health_ready_and_security_headers(api):
     assert c.get("/static/mosquito-hero.webp").status_code == 200
     assert c.get("/static/mosquito-hero-profit.webp").status_code == 200
     assert c.get("/static/mosquito.svg").status_code == 404
+
+
+def test_public_broker_health_authenticates_read_only_without_account_data(api,monkeypatch):
+    module,c,_=api
+    monkeypatch.setenv("ALPACA_API_KEY","paper-key");monkeypatch.setenv("ALPACA_SECRET_KEY","paper-secret")
+    response=c.get("/broker-health")
+    assert response.status_code==200
+    assert response.json=={"status":"ok","configured":True,"authenticated":True,"account_readable":True,"clock_readable":True,"paper_mode":True,"checked_at":response.json["checked_at"]}
+    body=response.get_data(as_text=True)
+    assert "paper-key" not in body and "paper-secret" not in body and "buying_power" not in body and "account" not in body.lower().replace("account_readable","")
+
+
+def test_broker_health_failure_is_degraded_and_redacted(api,monkeypatch,caplog):
+    module,c,_=api
+    from alpaca.common.exceptions import APIError
+    secret="broker-health-secret"
+    monkeypatch.setenv("ALPACA_API_KEY","paper-key");monkeypatch.setenv("ALPACA_SECRET_KEY",secret)
+    module.BROKER_HEALTH_CACHE=None;module.BROKER_HEALTH_EXPIRES=0;module.BROKER_HEALTH_FUTURE=None
+    def fail():raise APIError(module.json.dumps({"code":40110000,"message":f"bad credentials {secret}"}))
+    monkeypatch.setattr(module,"_broker_health_probe",fail)
+    with caplog.at_level("WARNING"):
+        response=c.get("/broker-health")
+    assert response.status_code==503 and response.json["status"]=="degraded"
+    assert response.json["authenticated"] is False and response.json["paper_mode"] is True
+    output=response.get_data(as_text=True)+" "+" ".join(r.getMessage() for r in caplog.records)
+    assert secret not in output and "paper-key" not in output
 
 
 def test_token_protects_api_and_query_sets_cookie(api, monkeypatch):

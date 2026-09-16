@@ -1,6 +1,6 @@
 """Production API for Mosquito Runner; paper-safe by default."""
 from __future__ import annotations
-import hmac,json,math,os,re,tempfile,threading,time
+import concurrent.futures,hmac,json,math,os,re,tempfile,threading,time
 from collections import defaultdict,deque
 from datetime import date,datetime,timedelta,timezone
 from functools import wraps
@@ -16,6 +16,8 @@ from scheduler import MarketScheduler
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
 LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
 ENGINE_THREAD=None;ENGINE_THREAD_LOCK=threading.Lock();SCHEDULER_THREAD=None;SCHEDULER_THREAD_LOCK=threading.Lock();RUNTIME_STOP=threading.Event()
+BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
+BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
 DEFAULTS={"allocation":0.0,"requested_investment":0.0,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -60,6 +62,33 @@ def client():
     if not key or not secret: raise RuntimeError("missing credentials")
     from alpaca.trading.client import TradingClient
     return TradingClient(key,secret,paper=paper())
+def _broker_health_probe():
+    broker=client();broker.get_account();broker.get_clock()
+    return True
+def broker_health_data():
+    global BROKER_HEALTH_FUTURE,BROKER_HEALTH_CACHE,BROKER_HEALTH_EXPIRES
+    checked_at=now();key,secret=credentials()
+    if not key or not secret:return {"status":"degraded","configured":False,"authenticated":False,"account_readable":False,"clock_readable":False,"paper_mode":paper(),"checked_at":checked_at}
+    with BROKER_HEALTH_LOCK:
+        if BROKER_HEALTH_CACHE is not None and BROKER_HEALTH_EXPIRES>time.monotonic():return dict(BROKER_HEALTH_CACHE)
+        if BROKER_HEALTH_FUTURE is None or BROKER_HEALTH_FUTURE.done():BROKER_HEALTH_FUTURE=BROKER_HEALTH_POOL.submit(_broker_health_probe)
+        future=BROKER_HEALTH_FUTURE
+    timeout=max(.25,min(5.0,number(os.getenv("MOSQUITO_BROKER_HEALTH_TIMEOUT")) or 2.0))
+    try:
+        future.result(timeout=timeout)
+        result={"status":"ok","configured":True,"authenticated":True,"account_readable":True,"clock_readable":True,"paper_mode":paper(),"checked_at":checked_at}
+        ttl=30.0
+    except concurrent.futures.TimeoutError:
+        result={"status":"degraded","configured":True,"authenticated":False,"account_readable":False,"clock_readable":False,"paper_mode":paper(),"checked_at":checked_at}
+        ttl=5.0
+    except Exception as exc:
+        log_broker_error(exc,"broker_health_probe","/v2/account,/v2/clock")
+        result={"status":"degraded","configured":True,"authenticated":False,"account_readable":False,"clock_readable":False,"paper_mode":paper(),"checked_at":checked_at}
+        ttl=30.0
+    with BROKER_HEALTH_LOCK:
+        BROKER_HEALTH_CACHE=dict(result);BROKER_HEALTH_EXPIRES=time.monotonic()+ttl
+        if future.done():BROKER_HEALTH_FUTURE=None
+    return result
 class PaperBrokerAdapter:
     paper=True
     def __init__(self,broker):self.broker=broker
@@ -247,6 +276,9 @@ def health():return jsonify(status="ok",service="mosquito-runner",timestamp=now(
 @app.get("/ready")
 def ready():
     k,s=credentials();return jsonify(status="ready",alpaca_configured=bool(k and s),state_writable=os.access(STATE_PATH.parent,os.W_OK),timestamp=now())
+@app.get("/broker-health")
+def broker_health():
+    result=broker_health_data();return jsonify(result),(200 if result["status"]=="ok" else 503)
 def account_data():
     a=client().get_account(); fields=("id","status","currency","cash","portfolio_value","equity","last_equity","buying_power","daytrading_buying_power","regt_buying_power","trading_blocked","transfers_blocked","account_blocked","pattern_day_trader","daytrade_count")
     result={**{f:serial(getattr(a,f,None)) for f in fields},"connected":True,"mode":"paper" if paper() else "live"}
