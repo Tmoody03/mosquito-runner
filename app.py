@@ -16,10 +16,11 @@ from scheduler import MarketScheduler
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
 LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
 ENGINE_THREAD=None;ENGINE_THREAD_LOCK=threading.Lock();SCHEDULER_THREAD=None;SCHEDULER_THREAD_LOCK=threading.Lock();RUNTIME_STOP=threading.Event()
+RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
 BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
 BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
@@ -206,8 +207,51 @@ def ensure_scheduler():
     with SCHEDULER_THREAD_LOCK:
         if SCHEDULER_THREAD is None or not SCHEDULER_THREAD.is_alive():
             scheduler=scheduler_instance();SCHEDULER_THREAD=threading.Thread(target=scheduler.run_forever,args=(RUNTIME_STOP,),kwargs={"poll_seconds":15},name="mosquito-market-scheduler",daemon=True);SCHEDULER_THREAD.start()
+def reset_paths():
+    return [STATE_PATH,engine.PATH,Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")),Path(os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json")),Path(os.getenv("MOSQUITO_SIM_FILE","/data/mosquito-simulation.json"))]
+def reset_marker():return Path(os.getenv("MOSQUITO_RESET_MARKER","/data/mosquito-reset-marker.json"))
+def reset_status():
+    try:return json.loads(Path(os.getenv("MOSQUITO_RESET_STATUS","/data/mosquito-reset-status.json")).read_text())
+    except (OSError,ValueError):return {"status":"not_requested"}
+def write_reset_status(value):
+    path=Path(os.getenv("MOSQUITO_RESET_STATUS","/data/mosquito-reset-status.json"));path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(value,separators=(",",":")))
+def reset_done(reset_id):
+    try:return json.loads(reset_marker().read_text()).get("reset_id")==reset_id
+    except (OSError,ValueError):return False
+def run_paper_reset(reset_id):
+    try:
+        if not paper():raise RuntimeError("paper-only reset required")
+        write_reset_status({"status":"closing_old_paper_session","reset_id":reset_id,"started_at":now()})
+        broker=client();broker.close_all_positions(cancel_orders=True)
+        deadline=time.monotonic()+120
+        while time.monotonic()<deadline:
+            if not broker.get_all_positions():break
+            time.sleep(2)
+        remaining=broker.get_all_positions()
+        if remaining:raise RuntimeError(f"paper positions still open: {len(remaining)}")
+        for path in reset_paths():
+            try:path.unlink()
+            except FileNotFoundError:pass
+        account=broker.get_account();baseline=number(getattr(account,"equity",None))
+        state={**DEFAULTS,"allocation":50000.0,"requested_investment":50000.0,"baseline_equity":baseline,"running":True,"armed":True,"last_error":None};save_state(state)
+        marker=reset_marker();marker.parent.mkdir(parents=True,exist_ok=True);marker.write_text(json.dumps({"reset_id":reset_id,"completed_at":now()},separators=(",",":")))
+        write_reset_status({"status":"complete","reset_id":reset_id,"allocation":50000.0,"old_positions_remaining":0,"completed_at":now()})
+        with LOCK:CACHE.clear()
+        ensure_engine();ensure_scheduler()
+    except Exception as exc:
+        write_reset_status({"status":"failed","reset_id":reset_id,"error_type":type(exc).__name__,"failed_at":now()})
+        app.logger.error("paper reset failed: %s",type(exc).__name__)
+def ensure_reset():
+    global RESET_THREAD
+    reset_id=str(os.getenv("MOSQUITO_RESET_ID","")).strip()
+    if not reset_id or reset_done(reset_id):return True
+    with RESET_THREAD_LOCK:
+        if RESET_THREAD is None or not RESET_THREAD.is_alive():
+            RESET_THREAD=threading.Thread(target=run_paper_reset,args=(reset_id,),name="mosquito-paper-reset",daemon=True);RESET_THREAD.start()
+    return False
 def ensure_runtime():
-    if truthy("MOSQUITO_RUNTIME_ENABLED") or bool(os.getenv("RAILWAY_ENVIRONMENT")):ensure_engine();ensure_scheduler()
+    if truthy("MOSQUITO_RUNTIME_ENABLED") or bool(os.getenv("RAILWAY_ENVIRONMENT")):
+        if ensure_reset():ensure_engine();ensure_scheduler()
 def serial(v):
     if v is None or isinstance(v,(str,bool,int,float)): return v
     if isinstance(v,datetime): return v.isoformat()
@@ -307,13 +351,18 @@ def ready():
 @app.get("/broker-health")
 def broker_health():
     result=broker_health_data();return jsonify(result),(200 if result["status"]=="ok" else 503)
+@app.get("/reset-health")
+def reset_health():return jsonify(reset_status())
 def account_data():
     a=client().get_account(); fields=("id","status","currency","cash","portfolio_value","equity","last_equity","buying_power","daytrading_buying_power","regt_buying_power","trading_blocked","transfers_blocked","account_blocked","pattern_day_trader","daytrade_count")
     result={**{f:serial(getattr(a,f,None)) for f in fields},"connected":True,"mode":"paper" if paper() else "live"}
-    equity,last=number(result.get("equity")),number(result.get("last_equity"))
+    equity,last=number(result.get("equity")),number(result.get("last_equity"));raw_equity=equity
     result["day_profit"]=(equity-last) if equity is not None and last is not None else None
     result["day_profit_pct"]=((equity-last)/last*100) if equity is not None and last not in (None,0) else None
-    starting=number(load_state().get("requested_investment"))
+    saved=load_state();starting=number(saved.get("requested_investment"));baseline=number(saved.get("baseline_equity"))
+    if raw_equity is not None and baseline is not None and starting not in (None,0):
+        strategy_profit=raw_equity-baseline;result["broker_equity"]=result.get("equity");result["broker_portfolio_value"]=result.get("portfolio_value");result["equity"]=starting+strategy_profit;result["portfolio_value"]=starting+strategy_profit;result["day_profit"]=strategy_profit;result["day_profit_pct"]=strategy_profit/starting*100
+        equity=starting+strategy_profit
     result["total_profit"]=(equity-starting) if equity is not None and starting not in (None,0) else None
     result["total_profit_pct"]=((equity-starting)/starting*100) if equity is not None and starting not in (None,0) else None
     return result
