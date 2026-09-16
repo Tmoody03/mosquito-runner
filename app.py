@@ -124,7 +124,9 @@ def account_data():
     equity,last=number(result.get("equity")),number(result.get("last_equity"))
     result["day_profit"]=(equity-last) if equity is not None and last is not None else None
     result["day_profit_pct"]=((equity-last)/last*100) if equity is not None and last not in (None,0) else None
-    result["total_profit"]=None;result["total_profit_pct"]=None
+    starting=number(load_state().get("requested_investment"))
+    result["total_profit"]=(equity-starting) if equity is not None and starting not in (None,0) else None
+    result["total_profit_pct"]=((equity-starting)/starting*100) if equity is not None and starting not in (None,0) else None
     return result
 @app.get("/api/account")
 def account():
@@ -211,10 +213,26 @@ def dashboard_data():
     r["positions_count"]=len(r["positions"]) if isinstance(r["positions"],list) else None
     r.update(trades_today=None,win_rate=None,trades=[],performance=[])
     try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        orders=[serial(o) for o in client().get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED,limit=100))]
+        today=datetime.now(timezone.utc).date();filled=[]
+        for order in orders:
+            stamp=order.get("filled_at")
+            try:is_today=datetime.fromisoformat(str(stamp).replace("Z","+00:00")).astimezone(timezone.utc).date()==today
+            except (TypeError,ValueError):is_today=False
+            if is_today and order.get("filled_qty") not in (None,"0",0):filled.append(order)
+        r["trades"]=[{"symbol":o.get("symbol"),"side":o.get("side"),"qty":o.get("filled_qty"),"price":o.get("filled_avg_price"),"timestamp":o.get("filled_at"),"status":o.get("status")} for o in filled]
+        r["trades_today"]=len(filled)
+    except Exception:r["errors"].append("orders")
+    try:
         from alpaca.trading.requests import GetPortfolioHistoryRequest
         h=client().get_portfolio_history(GetPortfolioHistoryRequest(period="1D",timeframe="5Min",extended_hours=True))
         stamps,values=serial(h.timestamp),serial(h.equity)
         r["history"]=[{"timestamp":t,"equity":v} for t,v in zip(stamps,values)]
+        if values:
+            first,last=number(values[0]),number(values[-1])
+            r["performance"]=[{"label":"Today","profit":(last-first) if None not in (first,last) else None,"return_pct":((last-first)/first*100) if first not in (None,0) and last is not None else None,"trades":r["trades_today"]}]
     except Exception:r["history"]=[];r["errors"].append("history")
     alerts_=[]
     if st["last_error"]:alerts_.append({"type":"error","message":st["last_error"]})

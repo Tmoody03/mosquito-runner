@@ -14,14 +14,14 @@
   <header class="hero" aria-labelledby="app-title">
    <div class="hero-art"><img src="/static/mosquito.svg" alt="Mosquito trading bot logo"></div>
    <div class="hero-copy"><p class="kicker">V5.8 MASTER</p><h1 id="app-title">MOSQUITO</h1><p>AI TRADING BOT</p><em>SUCKING THE PROFIT OUT OF THE MARKET</em><span>AUTONOMOUS MODE</span></div>
-   <div class="connection"><i id="connection-dot"></i><strong id="connection-label">CONNECTING</strong><small id="automation-label">Checking systems</small></div>
+   <div class="header-actions"><div class="connection"><i id="connection-dot"></i><strong id="connection-label">CONNECTING</strong><small id="automation-label">Checking systems</small></div><button id="menu-button" class="menu-button" type="button" aria-label="Open menu" aria-expanded="false">☰</button></div>
   </header>
 
   <section id="dashboard-view" class="view active" aria-label="Dashboard">
    <section class="panel investment-panel">
-    <div class="investment-control"><label for="investment">YOUR INVESTMENT AMOUNT</label><div class="money-input"><span>$</span><input id="investment" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" placeholder="Enter amount" aria-describedby="investment-help"></div><div class="slider-row"><span>$0</span><input id="investment-slider" type="range" min="0" max="100000" step="500" value="50000" aria-label="Investment amount slider"><output id="investment-slider-value" for="investment-slider">$50,000</output></div><small id="investment-help">Set any amount; available buying power is verified before trading</small></div>
+    <div class="investment-control"><label for="investment">YOUR INVESTMENT AMOUNT</label><div class="money-input"><span>$</span><input id="investment" type="text" inputmode="decimal" autocomplete="off" placeholder="Enter amount" aria-describedby="investment-help"><button id="edit-investment" type="button" aria-label="Edit investment amount">✎</button></div><div class="slider-row"><span>$0</span><input id="investment-slider" type="range" min="0" max="100000" step="500" value="50000" aria-label="Investment amount slider"><output id="investment-slider-value" for="investment-slider">$50,000</output></div><small id="investment-help">Enter any positive amount; buying power is verified before the bot starts</small></div>
     <div class="trade-actions">
-     <button id="start-button" class="button primary" type="button"><span aria-hidden="true">▶</span> START BOT</button>
+     <button id="start-button" class="button primary" type="button"><span aria-hidden="true">▶</span> <span id="primary-label">START BOT</span></button>
      <button id="stop-button" class="button stop" type="button">■ STOP</button>
      <button id="exit-button" class="button exit" type="button">EXIT POSITIONS</button>
      <small id="action-hint">Controls use protected server endpoints</small>
@@ -59,6 +59,7 @@
   <section id="performance-view" class="view" aria-label="Performance"><div class="panel page-panel"><h2>PERFORMANCE</h2><div id="performance-list" class="data-list"><p class="empty">Waiting for performance data</p></div></div></section>
   <section id="alerts-view" class="view" aria-label="Alerts"><div class="panel page-panel"><h2>ALERTS</h2><div id="alerts-list" class="data-list"><p class="empty">No alerts received</p></div></div></section>
 
+  <aside id="app-menu" class="app-menu" hidden><button id="menu-close" type="button" aria-label="Close menu">×</button><h2>MOSQUITO</h2><p id="menu-mode">Checking trading mode…</p><a href="#dashboard-view">Dashboard</a><a href="#positions-view">Positions</a><a href="#alerts-view">Alerts</a></aside><div id="menu-scrim" class="menu-scrim" hidden></div>
   <nav class="bottom-nav" aria-label="Main navigation">
    <button class="active" data-view="dashboard-view"><span>⌂</span>DASHBOARD</button><button data-view="positions-view"><span>▥</span>POSITIONS</button><button data-view="history-view"><span>↶</span>HISTORY</button><button data-view="performance-view"><span>↗</span>PERFORMANCE</button><button data-view="alerts-view"><span>●</span>ALERTS<b id="alert-badge" hidden>0</b></button>
   </nav>

@@ -1,6 +1,7 @@
 import importlib
 import math
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,12 @@ class FakeClient:
         return [SimpleNamespace(asset_id="a",symbol="NVDA",exchange="NASDAQ",asset_class="us_equity",
             qty="2",side="long",market_value="300",cost_basis="250",unrealized_pl="50",
             unrealized_plpc=".2",current_price="150",lastday_price="145",change_today=".034")]
+    def get_orders(self, filter=None):
+        return [{"symbol":"NVDA","side":"buy","filled_qty":"2","filled_avg_price":"150",
+            "filled_at":datetime.now(timezone.utc),"status":"filled"}]
+    def get_portfolio_history(self, request=None):
+        return SimpleNamespace(timestamp=[1,2], equity=[9900,10000], profit_loss=[0,100],
+            profit_loss_pct=[0,.0101], base_value=9900)
     def close_all_positions(self, cancel_orders=False):
         self.closed += 1
         return [{"symbol":"NVDA","status":"accepted","cancel_orders":cancel_orders}]
@@ -68,13 +75,17 @@ def test_config_persists_and_rejects_bad_numbers(api):
 
 
 def test_account_positions_dashboard_and_alerts_use_real_values(api):
-    _, c, _ = api
+    module, c, _ = api
+    state=module.load_state();state["requested_investment"]=9000;module.save_state(state);module.CACHE.clear()
     assert c.get("/api/account").json["equity"] == "10000"
+    assert c.get("/api/account").json["total_profit"] == 1000
     assert c.get("/api/account").json["mode"] == "paper"
     assert c.get("/api/positions").json["positions"][0]["symbol"] == "NVDA"
     board = c.get("/api/dashboard").json
     assert board["account"]["buying_power"] == "12000"
     assert board["positions"][0]["unrealized_pl"] == "50"
+    assert board["trades_today"] == 1 and board["trades"][0]["symbol"] == "NVDA"
+    assert board["performance"][0]["profit"] == 100
     assert c.get("/api/alerts").json["count"] == 0
 
 
