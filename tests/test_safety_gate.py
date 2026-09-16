@@ -57,12 +57,12 @@ def test_no_sale_below_entry_even_after_large_prior_gain():
     assert guard["protected_floor"] == 100.0
 
 
-def test_tenth_percent_trigger_boundary_is_inclusive():
+def test_five_hundredths_percent_trigger_boundary_is_inclusive():
     peak = 110.0
-    trigger = peak * 0.999
+    trigger = peak * 0.9995
     assert protected_state(100.0, trigger + 0.000_002, peak)["should_sell"] is False
     at_boundary = protected_state(100.0, trigger, peak)
-    assert at_boundary["trailing_trigger"] == pytest.approx(109.89)
+    assert at_boundary["trailing_trigger"] == pytest.approx(109.945)
     assert at_boundary["should_sell"] is True
 
 
