@@ -76,6 +76,8 @@ def _save_cache(cache):
 
 
 def _fresh(row):
+    if "sec_company_mapping_unavailable" in row.get("reasons", []):
+        return False
     try:
         checked = datetime.fromisoformat(row["checked_at"].replace("Z", "+00:00"))
         return datetime.now(timezone.utc) - checked <= timedelta(days=CACHE_DAYS)
