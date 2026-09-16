@@ -1,22 +1,43 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 260" role="img" aria-labelledby="title desc">
-  <title id="title">Mosquito trading bot</title>
-  <desc id="desc">A neon green and black mosquito with dollar sign wings</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 320" role="img" aria-labelledby="title desc">
+  <title id="title">The Mosquito trading bot</title>
+  <desc id="desc">A red, white and blue mechanical mosquito with dollar-sign wings and burnout smoke</desc>
   <defs>
-    <linearGradient id="wing" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#edff72"/><stop offset="1" stop-color="#67e600"/></linearGradient>
-    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#56616b"/><stop offset=".5" stop-color="#080b0c"/><stop offset="1" stop-color="#1b2227"/></linearGradient>
-    <filter id="glow"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#4f9dff"/><stop offset=".48" stop-color="#1354b7"/><stop offset="1" stop-color="#061c4b"/></linearGradient>
+    <linearGradient id="red" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#ff5a5f"/><stop offset=".5" stop-color="#e3182d"/><stop offset="1" stop-color="#720515"/></linearGradient>
+    <linearGradient id="steel" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff"/><stop offset=".38" stop-color="#cdd8e4"/><stop offset=".7" stop-color="#758596"/><stop offset="1" stop-color="#fff"/></linearGradient>
+    <radialGradient id="eye"><stop stop-color="#fff68a"/><stop offset=".3" stop-color="#ff351d"/><stop offset="1" stop-color="#6b0000"/></radialGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="smoke"><feGaussianBlur stdDeviation="6"/></filter>
   </defs>
-  <g filter="url(#glow)" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M148 106C105 16 32 10 18 36c-18 34 70 77 126 92" fill="url(#wing)" stroke="#a3ff29" stroke-width="7"/>
-    <path d="M208 105c45-88 118-90 133-64 17 32-68 72-129 88" fill="url(#wing)" stroke="#a3ff29" stroke-width="7"/>
-    <text x="65" y="77" fill="#fff" stroke="#3c7f00" stroke-width="2" font-family="Arial Black,sans-serif" font-size="45">$</text>
-    <text x="257" y="78" fill="#fff" stroke="#3c7f00" stroke-width="2" font-family="Arial Black,sans-serif" font-size="45">$</text>
-    <path d="M137 129 73 115M220 129l68-17M145 153 72 192M214 154l72 42M152 174l-45 68M204 174l46 67" fill="none" stroke="#151b1e" stroke-width="12"/>
-    <ellipse cx="178" cy="157" rx="48" ry="66" fill="url(#body)" stroke="#a3ff29" stroke-width="5"/>
-    <circle cx="178" cy="104" r="38" fill="url(#body)" stroke="#9aa1a5" stroke-width="5"/>
-    <path d="m166 90-22-10 18 24m28-14 22-10-18 24" fill="#ff1717" stroke="#ff4a22" stroke-width="5"/>
-    <path d="M154 116q24 28 49-1-5 35-47 22" fill="#fff" stroke="#090b0c" stroke-width="5"/>
-    <path d="m198 124 94 104-118-89" fill="#32383d" stroke="#c7ced1" stroke-width="4"/>
-    <path d="M157 72 133 34m67 38 24-38" fill="none" stroke="#1c2226" stroke-width="8"/>
+  <g class="smoke" opacity=".55" filter="url(#smoke)" fill="#dce8f4">
+    <ellipse cx="92" cy="265" rx="55" ry="21"/><ellipse cx="53" cy="237" rx="37" ry="18"/><ellipse cx="326" cy="268" rx="62" ry="22"/><ellipse cx="370" cy="239" rx="32" ry="17"/>
   </g>
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <path d="M180 131C145 24 49 15 22 52c-30 42 70 99 150 107" fill="url(#blue)" stroke="#f7fbff" stroke-width="7"/>
+    <path d="M241 131C278 24 373 16 399 53c29 42-69 97-150 106" fill="url(#red)" stroke="#f7fbff" stroke-width="7"/>
+    <path d="M165 91C128 52 74 41 44 55c28 7 62 31 88 66" fill="none" stroke="#df1730" stroke-width="12"/>
+    <path d="M255 91c37-39 90-50 120-35-28 7-62 30-88 65" fill="none" stroke="#2368c9" stroke-width="12"/>
+    <text x="75" y="108" fill="#fff" stroke="#071d4b" stroke-width="2" paint-order="stroke" font-family="Arial Black,sans-serif" font-size="64">$</text>
+    <text x="291" y="108" fill="#fff" stroke="#630817" stroke-width="2" paint-order="stroke" font-family="Arial Black,sans-serif" font-size="64">$</text>
+    <g fill="none" stroke="url(#steel)" stroke-width="10">
+      <path d="m176 175-92-21M165 196 73 231M184 218l-58 63M244 175l92-21M255 196l92 35M236 218l58 63"/>
+    </g>
+    <g fill="#111820" stroke="#f2f6fa" stroke-width="5">
+      <circle cx="81" cy="155" r="13"/><circle cx="73" cy="231" r="13"/><circle cx="126" cy="281" r="13"/>
+      <circle cx="339" cy="155" r="13"/><circle cx="347" cy="231" r="13"/><circle cx="294" cy="281" r="13"/>
+    </g>
+    <ellipse cx="210" cy="202" rx="48" ry="75" fill="url(#blue)" stroke="#f7fbff" stroke-width="6"/>
+    <path d="M169 181h82M169 210h82M178 240h64" fill="none" stroke="#e3182d" stroke-width="16"/>
+    <circle cx="210" cy="137" r="46" fill="url(#steel)" stroke="#1758a7" stroke-width="7"/>
+    <path d="m199 126-29-10 24 29m27-19 29-10-24 29" fill="url(#eye)" stroke="#74000c" stroke-width="5" filter="url(#glow)"/>
+    <path d="M184 151q26 28 53 0-8 35-50 19" fill="#0b1017" stroke="#e3182d" stroke-width="4"/>
+    <path d="m239 153 139 111-161-85" fill="url(#steel)" stroke="#edf4fb" stroke-width="5"/>
+    <path d="M188 95 159 49m73 46 29-46" fill="none" stroke="url(#steel)" stroke-width="8"/>
+    <circle cx="157" cy="46" r="8" fill="#e3182d"/><circle cx="263" cy="46" r="8" fill="#2f70d6"/>
+  </g>
+  <style>
+    .smoke{transform-origin:center;animation:burnout 1.8s ease-in-out infinite alternate}
+    @keyframes burnout{to{opacity:.9;transform:scale(1.08) translateY(-4px)}}
+    @media (prefers-reduced-motion:reduce){.smoke{animation:none}}
+  </style>
 </svg>

@@ -9,9 +9,9 @@ from flask import Flask,jsonify,make_response,request,send_from_directory,redire
 from strategy import build_watchlist
 
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
-LOCK=threading.RLock(); CACHE={}; CALLS=defaultdict(deque)
+LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"daily_goal":500.0,"running":False,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"daily_goal":500.0,"running":False,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return not(truthy("ALPACA_LIVE_TRADING") and truthy("ALPACA_ENABLE_ORDER_EXECUTION"))
@@ -40,7 +40,11 @@ def load_state():
             raw=json.loads(STATE_PATH.read_text())
             if not isinstance(raw,dict): raw={}
         except (OSError,ValueError): raw={}
-        return {**DEFAULTS,**{k:raw[k] for k in DEFAULTS if k in raw}}
+        state={**DEFAULTS,**{k:raw[k] for k in DEFAULTS if k in raw}}
+        # States written before requested_investment existed used allocation for
+        # both the owner's request and the buying-power-capped allocation.
+        if "requested_investment" not in raw:state["requested_investment"]=state["allocation"]
+        return state
 def save_state(state):
     state={**DEFAULTS,**{k:state[k] for k in DEFAULTS if k in state},"updated_at":now()}
     with LOCK:
@@ -184,7 +188,7 @@ def scan():
     except Exception as exc:
         s=load_state();s["last_error"]="Market scan unavailable";save_state(s);app.logger.warning("scan failure: %s",type(exc).__name__);return error("Market scan is temporarily unavailable",503)
 def status_data():
-    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"allocation":st["allocation"],"investment_amount":st["allocation"],"daily_goal":st["daily_goal"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
+    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"allocation":st["allocation"],"investment_amount":st["requested_investment"],"daily_goal":st["daily_goal"],"exit_status":st["exit_status"],"exit_request_id":st["exit_request_id"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
 @app.get("/api/status")
 def status():return jsonify(status_data())
 @app.get("/api/alerts")
@@ -220,29 +224,94 @@ def dashboard_data():
 @rate_limit()
 def start():
     s=load_state();body=request.get_json(silent=True) or {}
-    try:req=nonnegative(body.get("allocation",body.get("investment_amount",s["allocation"])),"allocation")
+    try:req=nonnegative(body.get("allocation",body.get("investment_amount",s["requested_investment"])),"allocation")
     except ValueError as exc:return error(str(exc))
     if req<=0:return error("allocation must be greater than zero")
+    s["requested_investment"]=req
+    try:save_state(s)
+    except OSError as exc:
+        app.logger.error("state persistence failure: %s",type(exc).__name__)
+        return error("Bot state could not be saved",500)
     try:
         bp=number(cached("account",1,account_data).get("buying_power"))
-        if bp is None:return error("Buying power is unavailable",409)
+        if bp is None:
+            s["last_error"]="Buying power is unavailable";save_state(s)
+            return error("Buying power is unavailable",409)
         allocation=min(req,max(0,bp))
-        if allocation<=0:return error("No buying power is available",409)
-    except Exception as exc:return upstream(exc)
-    already=bool(s["running"]);s.update(running=True,allocation=allocation,last_error=None);save_state(s)
+        if allocation<=0:
+            s["last_error"]="No buying power is available";save_state(s)
+            return error("No buying power is available",409)
+    except Exception as exc:
+        s["last_error"]="Broker service is temporarily unavailable"
+        try:save_state(s)
+        except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
+        return upstream(exc)
+    already=bool(s["running"]);s.update(running=True,allocation=allocation,last_error=None)
+    try:save_state(s)
+    except OSError as exc:
+        app.logger.error("state persistence failure: %s",type(exc).__name__)
+        return error("Bot state could not be saved",500)
     return jsonify(ok=True,running=True,already_running=already,allocation=allocation,requested_allocation=req,capped=allocation<req,execution_enabled=enabled(),mode="paper" if paper() else "live",timestamp=now())
 @app.post("/api/bot/stop")
 @rate_limit()
 def stop():
-    s=load_state();already=not bool(s["running"]);s["running"]=False;save_state(s);return jsonify(ok=True,running=False,already_stopped=already,positions_unchanged=True,timestamp=now())
+    s=load_state();already=not bool(s["running"]);s["running"]=False
+    try:save_state(s)
+    except OSError as exc:
+        app.logger.error("state persistence failure: %s",type(exc).__name__)
+        return error("Bot state could not be saved",500)
+    return jsonify(ok=True,running=False,already_stopped=already,positions_unchanged=True,
+        message="New entries are stopped; existing positions were not changed",timestamp=now())
 @app.post("/api/bot/exit")
 @rate_limit(5)
 def exit_bot():
-    s=load_state();s["running"]=False;save_state(s)
-    if not enabled():return jsonify(ok=True,running=False,executed=False,message="Exit recorded; broker execution is disabled",timestamp=now())
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict) or body.get("confirm")!="EXIT ALL POSITIONS":
+        return error('confirmation is required; send {"confirm":"EXIT ALL POSITIONS"}',400)
+    request_id=str(body.get("request_id","")).strip()
+    if len(request_id)>128:return error("request_id must be 128 characters or fewer")
+    if request_id:
+        with LOCK:
+            prior=EXIT_RESULTS.get(request_id)
+        if prior:
+            http_status=prior["http_status"]
+            return jsonify({k:v for k,v in prior.items() if k!="http_status"}),http_status
+    if not EXIT_LOCK.acquire(blocking=False):
+        return error("An exit request is already in progress",409)
     try:
+        s=load_state();s.update(running=False,exit_status="requested",exit_request_id=request_id or None,last_error=None)
+        try:save_state(s)
+        except OSError as exc:
+            app.logger.error("state persistence failure: %s",type(exc).__name__)
+            return error("Bot state could not be saved; no broker request was sent",500)
+        if not enabled():
+            s.update(exit_status="blocked",last_error="Exit was not submitted because broker execution is disabled")
+            try:save_state(s)
+            except OSError as exc:app.logger.error("state persistence failure: %s",type(exc).__name__)
+            return jsonify(ok=False,running=False,executed=False,submitted=False,completed=False,
+                status="blocked",message="Exit was not submitted because broker execution is disabled",timestamp=now()),409
         result=client().close_all_positions(cancel_orders=True)
+        rows=serial(result); rows=rows if isinstance(rows,list) else [rows]
+        failures=[row for row in rows if isinstance(row,dict) and isinstance(row.get("status"),int) and row["status"]>=400]
+        status="partial_failure" if failures else "pending"
+        message=("Some close requests were rejected; verify the remaining positions" if failures else
+            "Close requests were accepted by Alpaca and are pending; completion has not been verified")
+        s.update(exit_status=status,last_error=message if failures else None)
+        try:save_state(s)
+        except OSError as exc:app.logger.error("state persistence failure: %s",type(exc).__name__)
+        payload={"ok":not failures,"running":False,"executed":True,"submitted":True,"completed":False,
+            "status":status,"message":message,"results":rows,"failures":failures,
+            "mode":"paper" if paper() else "live","request_id":request_id or None,"timestamp":now()}
+        http_status=502 if failures else 202
+        if request_id:
+            with LOCK:EXIT_RESULTS[request_id]={**payload,"http_status":http_status}
         with LOCK:CACHE.clear()
-        return jsonify(ok=True,running=False,executed=True,results=serial(result),mode="paper" if paper() else "live",timestamp=now())
-    except Exception as exc:return upstream(exc)
+        return jsonify(payload),http_status
+    except Exception as exc:
+        s=load_state();s.update(running=False,exit_status="failed",last_error="Broker rejected or could not process the exit request")
+        try:save_state(s)
+        except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
+        with LOCK:CACHE.clear()
+        return upstream(exc)
+    finally:EXIT_LOCK.release()
 if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
