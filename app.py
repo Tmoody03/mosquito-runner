@@ -20,7 +20,7 @@ RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
 BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
 BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selected_watchlist":[],"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selected_watchlist":[],"last_qualified_count":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
@@ -415,6 +415,12 @@ def session_health():
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
     saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason"),"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
+    try:
+        lifecycle=json.loads(Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")).read_text())
+        payload["lifecycle_orders"]=len(lifecycle.get("orders") or {})
+        payload["lifecycle_positions"]=len(lifecycle.get("positions") or {})
+        payload["retired_positions"]=len(lifecycle.get("retired") or {})
+    except (OSError,ValueError,TypeError):pass
     try:
         payload["open_positions"]=len(client().get_all_positions())
         from alpaca.trading.enums import QueryOrderStatus
