@@ -138,7 +138,7 @@ def tradable_picks(broker,count=50):
     if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
     return picks
-def entry_signal_met(session_open,current_price,threshold=0.005):
+def entry_signal_met(session_open,current_price,threshold=0.001):
     """Return true only after a stock gains the required amount from today's open."""
     opened=number(session_open);current=number(current_price);threshold=number(threshold)
     return bool(opened and opened>0 and current and current>0 and threshold is not None and threshold>=0 and current>=opened*(1+threshold))
@@ -149,7 +149,7 @@ def confirmed_entry_picks(picks):
     from alpaca.data.requests import StockSnapshotRequest
     key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
     market=StockHistoricalDataClient(key,secret);threshold=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"))
-    if threshold is None:threshold=0.005
+    if threshold is None:threshold=0.001
     if threshold<0 or threshold>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
     rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
     symbols=list(rows)
@@ -378,7 +378,7 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.005,"trailing_drop_pct":0.10,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"selected":len(saved.get("selected_watchlist") or []),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
+    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"selected":len(saved.get("selected_watchlist") or []),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
     try:
         payload["open_positions"]=len(client().get_all_positions())
         from alpaca.trading.enums import QueryOrderStatus
