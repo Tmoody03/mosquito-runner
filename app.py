@@ -178,13 +178,19 @@ def confirmed_entry_picks(picks):
         batch=symbols[offset:offset+10]
         snapshots=snapshots_for(batch)
         for symbol in batch:
-            snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None)
-            opened=number(getattr(bar,"open",None));current=number(getattr(trade,"price",None));stamp=getattr(trade,"timestamp",None)
+            snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None);quote=getattr(snap,"latest_quote",None);minute=getattr(snap,"minute_bar",None)
+            opened=number(getattr(bar,"open",None))
+            # The executable ask is the conservative live buy observation. IEX's
+            # last trade can be old even while its quote is current, which made a
+            # healthy midday scan falsely report zero qualifiers.
+            ask=number(getattr(quote,"ask_price",None));bid=number(getattr(quote,"bid_price",None))
+            current=ask or (number(getattr(trade,"price",None))) or number(getattr(minute,"close",None))
+            stamp=(getattr(quote,"timestamp",None) if ask else None) or getattr(trade,"timestamp",None) or getattr(minute,"timestamp",None)
             if stamp is None:continue
             if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
-            if utc_now-stamp.astimezone(timezone.utc)>timedelta(minutes=2):continue
+            if utc_now-stamp.astimezone(timezone.utc)>timedelta(minutes=5):continue
             if not entry_signal_met(opened,current,threshold):continue
-            row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True);qualified.append(row)
+            row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True,entry_price_source=("ask" if ask else "last_trade"));qualified.append(row)
     return sorted(qualified,key=lambda row:(row.get("rank",10**9),-float(row.get("score",0))))
 def alpaca_history(symbols):
     import pandas as pd
