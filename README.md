@@ -5,11 +5,12 @@ Upload-ready, Railway-compatible reconstruction of the locked V5.8 Master dashbo
 ## Locked operating rules
 
 - AI / AI-infrastructure public-stock universe
-- minimum four years of price history
+- minimum three years of price history
 - top 50 preferred; top 25 research view
 - equal-weight allocation
 - prior-data-only ranking; no following-period lookahead
 - April trades only when the contemporaneous signal is positive
+- voluntary simulated sales are blocked below each lot's recorded purchase price
 - Fidelity tradability remains the live eligibility constraint
 - Alpaca is paper/API connectivity, not the ranking engine
 

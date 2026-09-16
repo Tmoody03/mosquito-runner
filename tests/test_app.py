@@ -230,3 +230,17 @@ def test_dashboard_exposes_green_ribbon_when_enabled(api,monkeypatch):
     monkeypatch.setattr(module.simulator,"value",lambda:{"status":"FINAL · MARKET CLOSED","current_value":51000,"eod_value":51000,"ribbon_value":1000,"ribbon_earned":True})
     module.CACHE.clear();board=c.get("/api/dashboard").json
     assert board["green_ribbon"]["current_value"]==51000
+
+
+def test_simulator_never_voluntarily_sells_below_purchase(tmp_path,monkeypatch):
+    import simulator
+    monkeypatch.setattr(simulator,"PATH",tmp_path/"simulation.json")
+    simulator.save({**simulator.EMPTY,"active":True,"starting_value":2000,"cash":0,"positions":[
+        {"symbol":"WIN","qty":10,"entry_price":100,"entry_value":1000},
+        {"symbol":"LOSS","qty":10,"entry_price":100,"entry_value":1000}]})
+    monkeypatch.setattr(simulator,"_closes",lambda symbols:__import__("pandas").DataFrame(
+        {"WIN":[110],"LOSS":[90]},index=__import__("pandas").date_range("2026-09-15",periods=1)))
+    report=simulator.exit_all();saved=simulator.load()
+    assert [p["symbol"] for p in saved["positions"]]==["LOSS"]
+    assert saved["cash"]==1100 and report["blocked_below_purchase"]==["LOSS"]
+    assert report["completed"] is False

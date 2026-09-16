@@ -299,7 +299,11 @@ def exit_bot():
     if not isinstance(body,dict) or body.get("confirm")!="EXIT ALL POSITIONS":
         return error('confirmation is required; send {"confirm":"EXIT ALL POSITIONS"}',400)
     if truthy("MOSQUITO_ENABLE_SIMULATION") and not body.get("broker_exit"):
-        try:report=simulator.exit_all();s=load_state();s.update(running=False,exit_status="completed",last_error=None);save_state(s);CACHE.clear();return jsonify(ok=True,running=False,executed=True,submitted=False,completed=True,status="completed",message="Mosquito simulated positions were closed",green_ribbon=report,timestamp=now())
+        try:
+            report=simulator.exit_all();completed=bool(report.get("completed",True));status="completed" if completed else "partially_blocked"
+            message="Mosquito simulated positions were closed" if completed else "Profitable positions were closed; positions below purchase price remain held"
+            s=load_state();s.update(running=not completed,exit_status=status,last_error=None);save_state(s);CACHE.clear()
+            return jsonify(ok=completed,running=not completed,executed=True,submitted=False,completed=completed,status=status,message=message,green_ribbon=report,timestamp=now()),(200 if completed else 409)
         except Exception as exc:app.logger.warning("simulation exit failure: %s",type(exc).__name__);return error("Simulated positions could not be closed",503)
     request_id=str(body.get("request_id","")).strip()
     if len(request_id)>128:return error("request_id must be 128 characters or fewer")

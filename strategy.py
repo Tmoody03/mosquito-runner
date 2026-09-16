@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Public, non-OTC AI infrastructure universe. The four-year data rule is enforced below.
+# Public, non-OTC AI infrastructure universe. The three-year data rule is enforced below.
 AI_UNIVERSE = sorted(set("""
 AAPL AMD AMAT ANET ASML AVGO CDNS CLS COHR CRDO CRM CSCO DELL EQIX FSLR GEV GLW
 GOOG GOOGL HPE IBM INTC LITE LRCX META MRVL MSFT MU NBIS NEE NFLX NOW NVDA NXPI
@@ -34,7 +34,7 @@ def build_watchlist(count=50):
     if data.empty:
         raise RuntimeError("Market data is temporarily unavailable")
     close, volume = data["Close"], data["Volume"]
-    eligible = [t for t in close.columns if close[t].dropna().shape[0] >= 1008]
+    eligible = [t for t in close.columns if close[t].dropna().shape[0] >= 756]
     clean_close=close[eligible].ffill();latest=clean_close.iloc[-1]
     frame = _feature_frame(clean_close, volume[eligible].fillna(0))
     # Reconstructed, explicit V5.8 feature blend. No future holding-period data is used.

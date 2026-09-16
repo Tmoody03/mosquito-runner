@@ -55,7 +55,20 @@ def stop():
     data=load();data["active"]=False;save(data);return data
 
 def exit_all():
-    report=value();data=load();data.update(active=False,cash=float(report.get("current_value") or 0),positions=[]);save(data);return report
+    data=load();positions=data.get("positions",[])
+    if not positions:return value()
+    close=_closes([p["symbol"] for p in positions])
+    if close.empty:raise RuntimeError("Simulation prices are unavailable")
+    marks=close.iloc[-1];cash=float(data.get("cash") or 0);held=[];sold=[]
+    for p in positions:
+        mark=float(marks[p["symbol"]]);entry=float(p["entry_price"])
+        if mark+1e-9>=entry:
+            proceeds=float(p["qty"])*mark;cash+=proceeds;sold.append({"symbol":p["symbol"],"price":mark,"proceeds":round(proceeds,2)})
+        else:
+            held.append(p)
+    data.update(active=bool(held),cash=cash,positions=held,gate="BELOW_PURCHASE_BLOCK" if held else "CLOSED");save(data)
+    report=value();report.update(sold=sold,blocked_below_purchase=[p["symbol"] for p in held],completed=not held)
+    return report
 
 def _closes(symbols):
     if not symbols:return pd.DataFrame()
