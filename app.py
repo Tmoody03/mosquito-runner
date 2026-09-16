@@ -112,7 +112,7 @@ def login():
 def assets(name):
     if not name.startswith("static/"):return error("Not found",404)
     asset=name.removeprefix("static/")
-    if asset not in {"style.css","app.js","mosquito.svg"}:return error("Not found",404)
+    if asset not in {"style.css","app.js","mosquito-hero.webp","mosquito-hero-profit.webp"}:return error("Not found",404)
     return send_from_directory(Path(app.root_path)/"static",asset)
 @app.get("/health")
 def health():return jsonify(status="ok",service="mosquito-runner",timestamp=now())

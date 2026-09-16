@@ -53,6 +53,9 @@ def test_health_ready_and_security_headers(api):
     assert c.get("/ready").json["status"] == "ready"
     assert c.get("/").status_code == 200
     assert c.get("/static/app.js").status_code == 200
+    assert c.get("/static/mosquito-hero.webp").status_code == 200
+    assert c.get("/static/mosquito-hero-profit.webp").status_code == 200
+    assert c.get("/static/mosquito.svg").status_code == 404
 
 
 def test_token_protects_api_and_query_sets_cookie(api, monkeypatch):
