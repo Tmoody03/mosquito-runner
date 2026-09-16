@@ -353,6 +353,21 @@ def broker_health():
     result=broker_health_data();return jsonify(result),(200 if result["status"]=="ok" else 503)
 @app.get("/reset-health")
 def reset_health():return jsonify(reset_status())
+@app.get("/session-health")
+def session_health():
+    """Public, non-sensitive launch proof: counts and states only."""
+    scheduler_path=Path(os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"))
+    try:scheduler=json.loads(scheduler_path.read_text())
+    except (OSError,ValueError):scheduler={}
+    result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
+    payload={"status":"ok","paper_mode":paper(),"allocation":load_state().get("requested_investment"),"running":load_state().get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.005,"trailing_drop_pct":0.10,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"selected":result.get("selected"),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
+    try:
+        payload["open_positions"]=len(client().get_all_positions())
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        payload["open_orders"]=len(client().get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN,limit=100)))
+    except Exception:payload.update(status="degraded",open_positions=None,open_orders=None)
+    return jsonify(payload),(200 if payload["status"]=="ok" else 503)
 def account_data():
     a=client().get_account(); fields=("id","status","currency","cash","portfolio_value","equity","last_equity","buying_power","daytrading_buying_power","regt_buying_power","trading_blocked","transfers_blocked","account_blocked","pattern_day_trader","daytrade_count")
     result={**{f:serial(getattr(a,f,None)) for f in fields},"connected":True,"mode":"paper" if paper() else "live"}
