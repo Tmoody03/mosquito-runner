@@ -84,9 +84,9 @@ def _category_for(ticker):
                  if ticker in tickers), "other")
 
 
-def build_watchlist(count=50):
+def rank_watchlist(close,volume,count=50,*,source="provided_market_data"):
     count = max(1, min(int(count), len(AI_UNIVERSE)))
-    close, volume = _download_universe(AI_UNIVERSE)
+    close=close.sort_index();volume=volume.reindex(close.index)
     eligible = [ticker for ticker in close.columns
                 if close[ticker].dropna().shape[0] >= MIN_HISTORY_DAYS]
     if not eligible:
@@ -110,6 +110,12 @@ def build_watchlist(count=50):
             for i, (ticker, row) in enumerate(picks.iterrows())]
     return {"strategy": "V5.8 Master", "count": len(rows), "picks": rows,
             "eligible_count": len(frame), "universe_count": len(AI_UNIVERSE),
+            "data_source":source,
             "positive_signal": positive_signal, "april_trade_allowed": april_gate,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "notice": "Broad AI, infrastructure, and medical-AI exposure themes—not pure-play claims. Alpaca paper trading only."}
+
+
+def build_watchlist(count=50):
+    close,volume=_download_universe(AI_UNIVERSE)
+    return rank_watchlist(close,volume,count,source="yfinance_research_fallback")

@@ -6,7 +6,7 @@ from datetime import date,datetime,timedelta,timezone
 from functools import wraps
 from pathlib import Path
 from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
-from strategy import build_watchlist
+from strategy import AI_UNIVERSE,build_watchlist,rank_watchlist
 import simulator
 import engine
 from protection import protected_state
@@ -81,12 +81,30 @@ def reconcile_closed_positions(broker,life):
 def tradable_picks(broker,count=50):
     from alpaca.trading.enums import AssetClass,AssetStatus
     from alpaca.trading.requests import GetAssetsRequest
-    watch=build_watchlist(min(250,200+count));assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
+    assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
     tradable={str(getattr(a,"symbol","")).upper() for a in assets if bool(getattr(a,"tradable",False)) and bool(getattr(a,"fractionable",False))}
+    candidates=[symbol for symbol in AI_UNIVERSE if symbol in tradable];close,volume=alpaca_history(candidates);watch=rank_watchlist(close,volume,min(250,200+count),source="alpaca_daily_bars")
     picks=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
     if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
     return picks
+def alpaca_history(symbols):
+    import pandas as pd
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
+    market=StockHistoricalDataClient(key,secret);closes=[];volumes=[];start=datetime.now(timezone.utc)-timedelta(days=5*366)
+    for offset in range(0,len(symbols),60):
+        batch=symbols[offset:offset+60];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
+        if frame is None or frame.empty:continue
+        if isinstance(frame.index,pd.MultiIndex):
+            closes.append(frame["close"].unstack(level="symbol"));volumes.append(frame["volume"].unstack(level="symbol"))
+    if not closes:raise RuntimeError("Alpaca market history is unavailable")
+    close=pd.concat(closes,axis=1).sort_index();volume=pd.concat(volumes,axis=1).reindex(close.index)
+    close.columns=[str(c).upper() for c in close.columns];volume.columns=[str(c).upper() for c in volume.columns]
+    return close.loc[:,~close.columns.duplicated()],volume.loc[:,~volume.columns.duplicated()]
 def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if not paper_only or not paper():raise RuntimeError("paper-only launch required")
     state=load_state()
