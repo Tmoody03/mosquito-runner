@@ -188,6 +188,22 @@ def test_broker_errors_are_sanitized(api, monkeypatch):
     assert "SECRET" not in r.get_data(as_text=True)
 
 
+def test_alpaca_api_error_logs_safe_diagnostics_without_secrets(api,monkeypatch,caplog):
+    module,c,_=api
+    from alpaca.common.exceptions import APIError
+    secret="paper-secret-value"
+    monkeypatch.setenv("ALPACA_SECRET_KEY",secret)
+    def explode():raise APIError(module.json.dumps({"code":40110000,"message":f"authentication failed {secret}"}))
+    monkeypatch.setattr(module,"account_data",explode);module.CACHE.clear()
+    with caplog.at_level("WARNING"):
+        response=c.get("/api/account")
+    logged=" ".join(record.getMessage() for record in caplog.records)
+    assert response.status_code==503
+    assert '"operation":"get_account"' in logged and '"endpoint":"/v2/account"' in logged
+    assert '"code":"40110000"' in logged and '"message":"authentication failed [REDACTED]"' in logged
+    assert secret not in logged and "Authorization" not in logged
+
+
 def test_start_preserves_request_when_broker_is_unavailable(api, monkeypatch):
     module, c, _ = api
     def explode(): raise RuntimeError("SECRET broker credential detail")

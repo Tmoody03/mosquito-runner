@@ -1,6 +1,6 @@
 """Production API for Mosquito Runner; paper-safe by default."""
 from __future__ import annotations
-import hmac,json,math,os,tempfile,threading,time
+import hmac,json,math,os,re,tempfile,threading,time
 from collections import defaultdict,deque
 from datetime import date,datetime,timedelta,timezone
 from functools import wraps
@@ -22,12 +22,31 @@ def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
 def enabled(): return truthy("ALPACA_ENABLE_ORDER_EXECUTION")
+def _safe_log_text(value):
+    text=str(value or "")[:300].replace("\r"," ").replace("\n"," ")
+    for name in ("ALPACA_API_KEY","ALPACA_API_KEY_ID","APCA_API_KEY_ID","ALPACA_SECRET_KEY","ALPACA_API_SECRET_KEY","APCA_API_SECRET_KEY"):
+        secret=os.getenv(name)
+        if secret:text=text.replace(secret,"[REDACTED]")
+    text=re.sub(r"(?i)(authorization|api[-_ ]?key|secret|token)(\s*[:=]\s*)([^,; ]+)",r"\1\2[REDACTED]",text)
+    return text
+def log_broker_error(exc,operation,endpoint=None):
+    fields={"error_class":type(exc).__name__,"operation":operation}
+    if endpoint:fields["endpoint"]=endpoint
+    try:
+        from alpaca.common.exceptions import APIError
+        if isinstance(exc,APIError):
+            for name in ("status_code","code","message"):
+                try:value=getattr(exc,name,None)
+                except Exception:value=None
+                if value not in (None,""):fields[name]=_safe_log_text(value)
+    except ImportError:pass
+    app.logger.warning("broker failure %s",json.dumps(fields,separators=(",",":"),sort_keys=True))
 def engine_loop():
     while True:
         try:
             if load_state().get("running"):
                 broker=client();life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life)
-        except Exception as exc:app.logger.warning("trailing engine cycle failed: %s",type(exc).__name__)
+        except Exception as exc:log_broker_error(exc,"trailing_engine_cycle")
         if RUNTIME_STOP.wait(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5)):break
 def ensure_engine():
     global ENGINE_THREAD
@@ -77,7 +96,7 @@ def reconcile_closed_positions(broker,life):
         try:
             picks=tradable_picks(broker,60);prices={p["ticker"]:p["price"] for p in picks};bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
             life.rebalance(picks,prices,bp,dead_symbols=())
-        except Exception as exc:app.logger.warning("replacement cycle failed: %s",type(exc).__name__)
+        except Exception as exc:log_broker_error(exc,"replacement_cycle")
     return closed
 def tradable_picks(broker,count=50):
     from alpaca.trading.enums import AssetClass,AssetStatus
@@ -174,7 +193,7 @@ def cached(key,ttl,loader):
     with LOCK:CACHE[key]=(t+ttl,value)
     return value
 def error(message,status=400): return jsonify(error=message,timestamp=now()),status
-def upstream(exc): app.logger.warning("upstream failure: %s",type(exc).__name__);return error("Broker service is temporarily unavailable",503)
+def upstream(exc,operation="broker_request",endpoint=None):log_broker_error(exc,operation,endpoint);return error("Broker service is temporarily unavailable",503)
 def authorized():
     expected=os.getenv("DASHBOARD_TOKEN")
     if not expected:return True
@@ -241,7 +260,7 @@ def account_data():
 @app.get("/api/account")
 def account():
     try:return jsonify(cached("account",10,account_data))
-    except Exception as exc:return upstream(exc)
+    except Exception as exc:return upstream(exc,"get_account","/v2/account")
 def position_rows():
     fields=("asset_id","symbol","exchange","asset_class","qty","side","market_value","cost_basis","unrealized_pl","unrealized_plpc","current_price","lastday_price","change_today","avg_entry_price")
     rows=[];tracked={p["symbol"]:p for p in engine.public_state()["positions"]}
@@ -259,7 +278,7 @@ def engine_status():return jsonify(engine.public_state())
 @app.get("/api/positions")
 def positions():
     try:r=cached("positions",8,position_rows);return jsonify(positions=r,count=len(r),timestamp=now())
-    except Exception as exc:return upstream(exc)
+    except Exception as exc:return upstream(exc,"get_positions","/v2/positions")
 @app.get("/api/orders")
 def orders():
     try:
@@ -270,7 +289,7 @@ def orders():
             from alpaca.trading.requests import GetOrdersRequest
             return [serial(o) for o in client().get_orders(filter=GetOrdersRequest(status={"all":QueryOrderStatus.ALL,"open":QueryOrderStatus.OPEN,"closed":QueryOrderStatus.CLOSED}[status],limit=100))]
         r=cached("orders:"+status,8,get);return jsonify(orders=r,count=len(r),timestamp=now())
-    except Exception as exc:return upstream(exc)
+    except Exception as exc:return upstream(exc,"get_orders","/v2/orders")
 @app.get("/api/portfolio-history")
 def history():
     period=request.args.get("period","1D");frame=request.args.get("timeframe","5Min")
@@ -281,7 +300,7 @@ def history():
             h=client().get_portfolio_history(GetPortfolioHistoryRequest(period=period,timeframe=frame,extended_hours=True))
             return {"timestamp":serial(h.timestamp),"equity":serial(h.equity),"profit_loss":serial(h.profit_loss),"profit_loss_pct":serial(h.profit_loss_pct),"base_value":serial(h.base_value),"period":period,"timeframe":frame}
         return jsonify(cached(f"history:{period}:{frame}",30,get))
-    except Exception as exc:return upstream(exc)
+    except Exception as exc:return upstream(exc,"get_portfolio_history","/v2/account/portfolio/history")
 @app.get("/api/config")
 def get_config():
     s=load_state();return jsonify(**{k:s[k] for k in ("allocation","daily_goal","updated_at")})
@@ -398,7 +417,7 @@ def start():
         s["last_error"]="Broker service is temporarily unavailable"
         try:save_state(s)
         except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
-        return upstream(exc)
+        return upstream(exc,"start_bot_get_account","/v2/account")
     already=bool(s["running"]);s.update(running=True,armed=True,allocation=allocation,last_error=None)
     simulation=None
     if truthy("MOSQUITO_ENABLE_SIMULATION"):
@@ -493,6 +512,6 @@ def exit_bot():
         try:save_state(s)
         except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
         with LOCK:CACHE.clear()
-        return upstream(exc)
+        return upstream(exc,"exit_bot")
     finally:EXIT_LOCK.release()
 if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
