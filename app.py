@@ -174,9 +174,13 @@ def confirmed_entry_picks(picks):
             if len(batch)<=1:return {}
             middle=len(batch)//2
             return {**snapshots_for(batch[:middle]),**snapshots_for(batch[middle:])}
-    for offset in range(0,len(symbols),10):
-        batch=symbols[offset:offset+10]
-        snapshots=snapshots_for(batch)
+    batches=[symbols[offset:offset+20] for offset in range(0,len(symbols),20)]
+    # A full-universe midday scan must finish before the signal changes. Fetch
+    # independent Alpaca snapshot batches concurrently instead of serially
+    # waiting through every symbol group.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6,max(1,len(batches)))) as pool:
+        batch_results=list(zip(batches,pool.map(snapshots_for,batches)))
+    for batch,snapshots in batch_results:
         for symbol in batch:
             snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None);quote=getattr(snap,"latest_quote",None);minute=getattr(snap,"minute_bar",None)
             opened=number(getattr(bar,"open",None))
