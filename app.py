@@ -20,7 +20,7 @@ RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
 BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
 BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selected_watchlist":[],"last_qualified_count":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selection_session":None,"selected_watchlist":[],"last_qualified_count":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
@@ -44,11 +44,20 @@ def log_broker_error(exc,operation,endpoint=None):
                 if value not in (None,""):fields[name]=_safe_log_text(value)
     except ImportError:pass
     app.logger.warning("broker failure %s",json.dumps(fields,separators=(",",":"),sort_keys=True))
+def paper_trade_window_open(broker):
+    clock=broker.get_clock()
+    if not bool(getattr(clock,"is_open",False)):return False
+    stamp=getattr(clock,"timestamp",None) or datetime.now(timezone.utc)
+    if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
+    eastern=stamp.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York"))
+    return (eastern.hour,eastern.minute)>=(9,50)
 def engine_loop():
     while True:
         try:
             if load_state().get("running"):
-                broker=client();life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life);scan_reentry_watchlist(broker,life)
+                broker=client()
+                if paper_trade_window_open(broker):
+                    life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life);scan_reentry_watchlist(broker,life)
         except Exception as exc:log_broker_error(exc,"trailing_engine_cycle")
         if RUNTIME_STOP.wait(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5)):break
 def ensure_engine():
@@ -179,7 +188,7 @@ def tradable_picks(broker,count=50):
     from alpaca.trading.requests import GetAssetsRequest
     assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
     tradable={str(getattr(a,"symbol","")).upper() for a in assets if bool(getattr(a,"tradable",False)) and bool(getattr(a,"fractionable",False))}
-    candidates=[symbol for symbol in AI_UNIVERSE if symbol in tradable];close,volume=alpaca_history(candidates);watch=rank_watchlist(close,volume,min(250,200+count),source="alpaca_daily_bars")
+    candidates=[symbol for symbol in AI_UNIVERSE if symbol in tradable];close,volume=alpaca_history(candidates);watch=rank_watchlist(close,volume,len(candidates),source="alpaca_daily_bars_full_universe")
     picks=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
     if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
@@ -241,7 +250,15 @@ def confirmed_entry_picks(picks):
             if utc_now-stamp.astimezone(timezone.utc)>timedelta(minutes=5):continue
             if not entry_signal_met(opened,current,threshold):continue
             row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True,entry_price_source=("ask" if ask else "last_trade"));qualified.append(row)
-    return sorted(qualified,key=lambda row:(row.get("rank",10**9),-float(row.get("score",0))))
+    if qualified:
+        ordered=sorted(qualified,key=lambda row:float(row.get("entry_signal_pct",0)))
+        denom=max(1,len(ordered)-1);strength={str(row.get("ticker")):index/denom for index,row in enumerate(ordered)}
+        for row in qualified:
+            historical=float(row.get("score",0));live_strength=strength.get(str(row.get("ticker")),0)
+            row["live_score"]=round(.75*historical+.25*live_strength*100,4)
+        qualified.sort(key=lambda row:(-float(row.get("live_score",0)),row.get("rank",10**9)))
+        for index,row in enumerate(qualified,1):row["intraday_rank"]=index
+    return qualified
 def alpaca_history(symbols):
     import pandas as pd
     from alpaca.data.enums import DataFeed
@@ -249,7 +266,7 @@ def alpaca_history(symbols):
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
-    market=StockHistoricalDataClient(key,secret);closes=[];volumes=[];start=datetime.now(timezone.utc)-timedelta(days=5*366)
+    market=StockHistoricalDataClient(key,secret);closes=[];volumes=[];start=datetime.now(timezone.utc)-timedelta(days=190)
     for offset in range(0,len(symbols),20):
         batch=symbols[offset:offset+20];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
         if frame is None or frame.empty:continue
@@ -271,7 +288,11 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     occupied=set(current.get("positions",{}))|{o.get("symbol") for o in current.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
     locked=list(state.get("selected_watchlist") or [])
     candidate_pool=list(state.get("selection_universe") or [])
-    if not candidate_pool:
+    if state.get("selection_session")!=session_date:
+        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in tradable_picks(broker,len(AI_UNIVERSE))]
+        candidates_by_symbol={str(row.get("ticker")):row for row in candidate_pool}
+        locked=[dict(candidates_by_symbol[symbol]) for symbol in occupied if symbol in candidates_by_symbol]
+    elif not candidate_pool:
         # Migrate the pre-full-universe state safely. With no broker exposure,
         # discard the old pre-gated 50 so qualified lower-ranked names can enter.
         if not occupied:locked=[]
@@ -286,7 +307,7 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     locked=sorted(by_symbol.values(),key=lambda row:row.get("rank",10**9))[:50]
     qualified_symbols={str(row.get("ticker")) for row in live_qualified}
     confirmed=[row for row in locked if str(row.get("ticker")) in qualified_symbols and str(row.get("ticker")) not in occupied]
-    state.update(selection_universe=candidate_pool,selected_watchlist=locked,last_qualified_count=len(live_qualified),last_scan=now(),last_error=None);save_state(state)
+    state.update(selection_universe=candidate_pool,selection_session=session_date,selected_watchlist=locked,last_qualified_count=len(live_qualified),last_scan=now(),last_error=None);save_state(state)
     picks=locked
     if len(occupied)<50:
         result=life.enter_available(confirmed,bp,total_budget=allocation)
@@ -301,7 +322,7 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
 def broker_calendar(*,start,end):
     from alpaca.trading.requests import GetCalendarRequest
     return client().get_calendar(GetCalendarRequest(start=date.fromisoformat(start),end=date.fromisoformat(end)))
-def scheduler_instance():return MarketScheduler(lambda:client().get_clock(),broker_calendar,orchestrate_open,state_path=os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"),paper_only=True)
+def scheduler_instance():return MarketScheduler(lambda:client().get_clock(),broker_calendar,orchestrate_open,state_path=os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"),paper_only=True,start_delay=timedelta(minutes=max(0,number(os.getenv("MOSQUITO_START_DELAY_MINUTES")) or 20)))
 def ensure_scheduler():
     global SCHEDULER_THREAD
     with SCHEDULER_THREAD_LOCK:
@@ -580,7 +601,7 @@ def scan():
     except Exception as exc:
         s=load_state();s["last_error"]="Market scan unavailable";save_state(s);app.logger.warning("scan failure: %s",type(exc).__name__);return error("Market scan is temporarily unavailable",503)
 def status_data():
-    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"allocation":st["allocation"],"investment_amount":st["requested_investment"],"daily_goal":st["daily_goal"],"exit_status":st["exit_status"],"exit_request_id":st["exit_request_id"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
+    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"allocation":st["allocation"],"investment_amount":st["requested_investment"],"daily_goal":st["daily_goal"],"scheduled_start_eastern":"09:50","exit_status":st["exit_status"],"exit_request_id":st["exit_request_id"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode · protected sell floor at filled purchase price" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
 @app.get("/api/status")
 def status():return jsonify(status_data())
 @app.get("/api/alerts")

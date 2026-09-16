@@ -317,6 +317,14 @@ def test_entry_gate_requires_half_percent_above_session_open(api):
     assert module.entry_signal_met(None,101.00) is False
 
 
+def test_automated_trading_waits_until_0950_eastern(api):
+    module, _client, _fake = api
+    before=SimpleNamespace(is_open=True,timestamp=datetime(2026,9,17,13,49,tzinfo=timezone.utc))
+    launch=SimpleNamespace(is_open=True,timestamp=datetime(2026,9,17,13,50,tzinfo=timezone.utc))
+    assert module.paper_trade_window_open(SimpleNamespace(get_clock=lambda:before)) is False
+    assert module.paper_trade_window_open(SimpleNamespace(get_clock=lambda:launch)) is True
+
+
 def test_broker_exit_holds_position_below_purchase(api, monkeypatch):
     module,c,fake=api
     monkeypatch.setenv("ALPACA_ENABLE_ORDER_EXECUTION","true")

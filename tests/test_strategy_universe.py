@@ -4,7 +4,7 @@ import pandas as pd
 import strategy
 
 
-def _market_frame(tickers, periods=1100):
+def _market_frame(tickers, periods=130):
     dates = pd.bdate_range("2021-01-01", periods=periods)
     columns = pd.MultiIndex.from_product([["Close", "Volume"], tickers])
     values = np.empty((periods, len(columns)))
@@ -33,10 +33,10 @@ def test_watchlist_returns_fifty_equal_weighted_prior_data_picks(monkeypatch):
     assert all(row["category"] != "other" for row in result["picks"])
 
 
-def test_four_year_filter_excludes_short_history(monkeypatch):
+def test_six_month_filter_excludes_short_history(monkeypatch):
     tickers = strategy.AI_UNIVERSE[:3]
     frame = _market_frame(tickers)
-    frame.loc[frame.index[:200], ("Close", tickers[0])] = np.nan
+    frame.loc[frame.index[:25], ("Close", tickers[0])] = np.nan
     monkeypatch.setattr(strategy, "DOWNLOAD_BATCH_SIZE", 1000)
     monkeypatch.setattr(strategy.yf, "download", lambda *args, **kwargs: frame)
     result = strategy.build_watchlist(3)

@@ -16,18 +16,18 @@ AI_UNIVERSE_BY_CATEGORY = {
     "medical_healthcare_ai": """ABT ABBV ALNY AMGN BDX BMY BSX CAH CI CNC CVS DXCM EW GILD HCA HOLX HUM IDXX ILMN INCY ISRG JNJ LH LLY MDT MRNA MRK NTRA PFE REGN RMD RPRX SYK TMO UNH VEEV VRTX WAT ZBH ZTS GH EXAS PACB RXRX SDGR CERT DOCS HIMS OSCR TDOC DHR IQV TECH CRL A WST COO PODD MASI PEN ALGN STE GEHC PHG NVS AZN SNY TAK BGNE BMRN BIIB NBIX IONS QDEL DGX ELV MOH HQY RGEN RVTY OPCH""".split(),
 }
 AI_UNIVERSE = sorted({ticker for tickers in AI_UNIVERSE_BY_CATEGORY.values() for ticker in tickers})
-MIN_HISTORY_DAYS = 1000
+MIN_HISTORY_DAYS = 110
 DOWNLOAD_BATCH_SIZE = 80
 
 
 def _feature_frame(close, volume):
     latest = close.iloc[-1]
-    returns = {n: latest / close.iloc[-n] - 1 for n in (22, 66, 132, 252)}
-    daily = close.pct_change(fill_method=None).tail(252)
+    returns = {n: latest / close.iloc[-n] - 1 for n in (5, 22, 66, 126)}
+    daily = close.pct_change(fill_method=None).tail(126)
     raw = pd.DataFrame({
-        "momentum_1m": returns[22], "momentum_3m": returns[66],
-        "momentum_6m": returns[132], "momentum_12m": returns[252],
-        "breakout": latest / close.tail(252).max() - 1,
+        "momentum_1w": returns[5], "momentum_1m": returns[22],
+        "momentum_3m": returns[66], "momentum_6m": returns[126],
+        "breakout": latest / close.tail(126).max() - 1,
         "relative_volume": volume.tail(22).mean() / volume.tail(66).mean() - 1,
         "quality": daily.mean() / daily.std(),
     })
@@ -63,7 +63,7 @@ def _download_universe(tickers):
     for start in range(0, len(tickers), DOWNLOAD_BATCH_SIZE):
         batch = tickers[start:start + DOWNLOAD_BATCH_SIZE]
         try:
-            data = yf.download(batch, period="5y", interval="1d", auto_adjust=True,
+            data = yf.download(batch, period="6mo", interval="1d", auto_adjust=True,
                                progress=False, group_by="column", threads=True)
         except Exception:
             continue
@@ -90,16 +90,16 @@ def rank_watchlist(close,volume,count=50,*,source="provided_market_data"):
     eligible = [ticker for ticker in close.columns
                 if close[ticker].dropna().shape[0] >= MIN_HISTORY_DAYS]
     if not eligible:
-        raise RuntimeError("No stocks met the four-year price-history requirement")
+        raise RuntimeError("No stocks met the six-month price-history requirement")
     clean_close = close[eligible].ffill()  # no backfill from future observations
     latest = clean_close.iloc[-1]
     frame = _feature_frame(clean_close, volume[eligible].fillna(0))
     if frame.empty:
         raise RuntimeError("Insufficient valid market history to rank stocks")
-    frame["teddy_score"] = (0.10*_rank01(frame.momentum_1m)+0.15*_rank01(frame.momentum_3m)+
-                            0.25*_rank01(frame.momentum_6m)+0.20*_rank01(frame.momentum_12m)+
-                            0.12*_rank01(frame.breakout)+0.08*_rank01(frame.relative_volume)+
-                            0.10*_rank01(frame.quality))
+    frame["teddy_score"] = (0.10*_rank01(frame.momentum_1w)+0.20*_rank01(frame.momentum_1m)+
+                            0.22*_rank01(frame.momentum_3m)+0.25*_rank01(frame.momentum_6m)+
+                            0.10*_rank01(frame.breakout)+0.08*_rank01(frame.relative_volume)+
+                            0.05*_rank01(frame.quality))
     picks = frame.sort_values("teddy_score", ascending=False).head(count)
     positive_signal = float(frame.momentum_1m.median()) > 0
     april_gate = datetime.now(timezone.utc).month != 4 or positive_signal

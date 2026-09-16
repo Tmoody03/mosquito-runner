@@ -23,16 +23,19 @@ def scheduler(tmp_path, at, rows, callback, is_open=True):
                            state_path=tmp_path / "runs.json")
 
 
-def test_waits_until_open_then_runs_once_and_survives_restart(tmp_path):
+def test_waits_until_0950_eastern_then_runs_once_and_survives_restart(tmp_path):
     calls = []
     day = date(2026, 9, 17)
     before = datetime(2026, 9, 17, 9, 29, tzinfo=ET)
     assert scheduler(tmp_path, before, [session(day)], lambda **kw: calls.append(kw)).tick()["status"] == "waiting"
     opened = datetime(2026, 9, 17, 9, 30, tzinfo=ET)
-    first = scheduler(tmp_path, opened, [session(day)], lambda **kw: calls.append(kw)).tick()
+    waiting = scheduler(tmp_path, opened, [session(day)], lambda **kw: calls.append(kw)).tick()
+    assert waiting["status"] == "waiting" and waiting["starts_at"].endswith("09:50:00-04:00")
+    launch = datetime(2026, 9, 17, 9, 50, tzinfo=ET)
+    first = scheduler(tmp_path, launch, [session(day)], lambda **kw: calls.append(kw)).tick()
     assert first["status"] == "completed"
     assert calls == [{"session_date": "2026-09-17", "idempotency_key": "mosquito-paper-open-2026-09-17", "paper_only": True}]
-    assert scheduler(tmp_path, opened, [session(day)], lambda **kw: calls.append(kw)).tick()["status"] == "already_completed"
+    assert scheduler(tmp_path, launch, [session(day)], lambda **kw: calls.append(kw)).tick()["status"] == "already_completed"
     assert len(calls) == 1
 
 
@@ -56,12 +59,12 @@ def test_weekends_and_holiday_do_not_run(tmp_path, day):
 def test_dst_uses_market_timezone_for_summer_and_winter(tmp_path):
     calls = []
     summer = date(2026, 7, 1)
-    # 13:30 UTC is 09:30 EDT.
-    summer_at = datetime(2026, 7, 1, 13, 30, tzinfo=timezone.utc)
+    # 13:50 UTC is 09:50 EDT.
+    summer_at = datetime(2026, 7, 1, 13, 50, tzinfo=timezone.utc)
     assert scheduler(tmp_path / "summer", summer_at, [session(summer)], lambda **kw: calls.append(kw)).tick()["status"] == "completed"
     winter = date(2026, 12, 1)
-    # 14:30 UTC is 09:30 EST.
-    winter_at = datetime(2026, 12, 1, 14, 30, tzinfo=timezone.utc)
+    # 14:50 UTC is 09:50 EST.
+    winter_at = datetime(2026, 12, 1, 14, 50, tzinfo=timezone.utc)
     assert scheduler(tmp_path / "winter", winter_at, [session(winter)], lambda **kw: calls.append(kw)).tick()["status"] == "completed"
     assert len(calls) == 2
 
