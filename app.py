@@ -240,7 +240,7 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     locked=sorted(by_symbol.values(),key=lambda row:row.get("rank",10**9))[:50]
     qualified_symbols={str(row.get("ticker")) for row in live_qualified}
     confirmed=[row for row in locked if str(row.get("ticker")) in qualified_symbols and str(row.get("ticker")) not in occupied]
-    state.update(selection_universe=candidate_pool,selected_watchlist=locked,last_scan=now(),last_error=None);save_state(state)
+    state.update(selection_universe=candidate_pool,selected_watchlist=locked,last_qualified_count=len(live_qualified),last_scan=now(),last_error=None);save_state(state)
     picks=locked
     if len(occupied)<50:
         result=life.enter_available(confirmed,bp,total_budget=allocation)
@@ -414,7 +414,7 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"selected":len(saved.get("selected_watchlist") or []),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
+    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason"),"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
     try:
         payload["open_positions"]=len(client().get_all_positions())
         from alpaca.trading.enums import QueryOrderStatus
