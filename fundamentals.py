@@ -133,10 +133,58 @@ def _backlog_from_filing(cik, submissions):
     return False, None, None
 
 
-def inspect_symbol(symbol, cik, *, fetch_json=_get_json):
+def _statement_value(statement, labels):
+    if statement is None or statement.empty:
+        return None, None
+    for label in labels:
+        if label in statement.index:
+            series = statement.loc[label].dropna()
+            if not series.empty:
+                return float(series.iloc[0]), label
+    return None, None
+
+
+def _inspect_yfinance(symbol, checked_at, error_type=None):
+    """Filing-derived fallback when a hosting provider cannot reach SEC.gov."""
+    import yfinance as yf
+    statement = yf.Ticker(symbol).quarterly_balance_sheet
+    assets, asset_tag = _statement_value(statement, ("Total Assets",))
+    liabilities, liability_tag = _statement_value(statement, ("Total Liabilities Net Minority Interest", "Total Liabilities"))
+    equity, equity_tag = _statement_value(statement, ("Stockholders Equity", "Common Stock Equity"))
+    cash, cash_tag = _statement_value(statement, ("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"))
+    debt, debt_tag = _statement_value(statement, ("Total Debt", "Net Debt"))
+    deferred_current, current_tag = _statement_value(statement, ("Current Deferred Revenue",))
+    deferred_noncurrent, noncurrent_tag = _statement_value(statement, ("Non Current Deferred Revenue",))
+    backlog_parts = [value for value in (deferred_current, deferred_noncurrent) if value is not None]
+    backlog_value = sum(max(0.0, value) for value in backlog_parts) if backlog_parts else None
+    backlog_ok = backlog_value is not None and backlog_value > 0
+    # An explicit zero Total Debt is valid evidence. Missing debt is not.
+    complete = all(value is not None for value in (assets, liabilities, equity, cash, debt))
+    asset_coverage = assets / liabilities if complete and liabilities > 0 else None
+    debt_covered = bool(complete and debt <= assets and (cash >= debt or asset_coverage >= MIN_ASSET_COVERAGE))
+    passed = bool(complete and assets > liabilities and equity > 0 and debt_covered and backlog_ok)
+    reasons = []
+    if not complete: reasons.append("missing_balance_sheet_evidence")
+    if complete and not assets > liabilities: reasons.append("nonpositive_net_assets")
+    if complete and not equity > 0: reasons.append("nonpositive_equity")
+    if complete and not debt_covered: reasons.append("debt_not_covered")
+    if not backlog_ok: reasons.append("missing_positive_backlog_evidence")
+    return {"ticker": symbol, "passed": passed, "checked_at": checked_at, "reasons": reasons,
+            "assets": assets, "liabilities": liabilities, "equity": equity, "cash": cash, "debt": debt,
+            "asset_coverage": asset_coverage, "cash_covers_debt": bool(complete and cash >= debt),
+            "backlog_confirmed": backlog_ok, "backlog_value": backlog_value,
+            "backlog_source": "+".join(tag for tag in (current_tag, noncurrent_tag) if tag) or None,
+            "backlog_filed": str(statement.columns[0].date()) if not statement.empty else None,
+            "evidence_provider": "filing-derived-yfinance", "sec_error_type": error_type,
+            "evidence_tags": [tag for tag in (asset_tag, liability_tag, equity_tag, cash_tag, debt_tag, current_tag, noncurrent_tag) if tag]}
+
+
+def inspect_symbol(symbol, cik=None, *, fetch_json=_get_json):
     """Return an auditable pass/fail result; any missing required fact fails."""
     checked_at = datetime.now(timezone.utc).isoformat()
     try:
+        if cik is None:
+            raise LookupError("SEC CIK mapping unavailable")
         company = fetch_json(f"{SEC_BASE}/api/xbrl/companyfacts/CIK{cik:010d}.json")
         facts = company.get("facts", {}).get("us-gaap", {})
         _, _, assets, asset_tag = _latest(facts, ASSET_TAGS)
@@ -167,9 +215,12 @@ def inspect_symbol(symbol, cik, *, fetch_json=_get_json):
                 "backlog_source": backlog_source, "backlog_filed": backlog_filed,
                 "evidence_tags": [asset_tag, liability_tag, equity_tag, cash_tag, *debt_tags]}
     except Exception as exc:
-        return {"ticker": symbol, "passed": False, "checked_at": checked_at,
-                "reasons": ["sec_evidence_unavailable"], "error_type": type(exc).__name__,
-                "backlog_confirmed": False}
+        try:
+            return _inspect_yfinance(symbol, checked_at, type(exc).__name__)
+        except Exception as fallback_exc:
+            return {"ticker": symbol, "passed": False, "checked_at": checked_at,
+                    "reasons": ["financial_evidence_unavailable"], "error_type": type(fallback_exc).__name__,
+                    "sec_error_type": type(exc).__name__, "backlog_confirmed": False}
 
 
 def screen_ranked(rows, required=50):
@@ -184,13 +235,9 @@ def screen_ranked(rows, required=50):
             mapping = {}
         workers = min(4, max(1, len(missing)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(inspect_symbol, symbol, mapping[symbol]): symbol for symbol in missing if symbol in mapping}
+            futures = {pool.submit(inspect_symbol, symbol, mapping.get(symbol)): symbol for symbol in missing}
             for future in concurrent.futures.as_completed(futures):
                 cache[futures[future]] = future.result()
-        for symbol in missing:
-            if symbol not in mapping:
-                cache[symbol] = {"ticker": symbol, "passed": False, "checked_at": datetime.now(timezone.utc).isoformat(),
-                                 "reasons": ["sec_company_mapping_unavailable"], "backlog_confirmed": False}
         with LOCK:
             _save_cache(cache)
     passed = []

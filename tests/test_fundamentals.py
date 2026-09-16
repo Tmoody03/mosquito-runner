@@ -62,3 +62,19 @@ def test_screen_only_returns_passes_from_fresh_cache(monkeypatch, tmp_path):
     result = fundamentals.screen_ranked(rows, required=50)
     assert [row["ticker"] for row in result] == ["GOOD"]
     assert result[0]["fundamental_gate"] == "PASS"
+
+
+def test_filing_statement_fallback_preserves_hard_rules(monkeypatch):
+    import pandas as pd
+    statement = pd.DataFrame({pd.Timestamp("2026-06-30"): {
+        "Total Assets": 500, "Total Liabilities Net Minority Interest": 300,
+        "Stockholders Equity": 200, "Cash Cash Equivalents And Short Term Investments": 150,
+        "Total Debt": 100, "Current Deferred Revenue": 80,
+    }})
+    class Ticker:
+        quarterly_balance_sheet = statement
+    monkeypatch.setattr("yfinance.Ticker", lambda _symbol: Ticker())
+    result = fundamentals.inspect_symbol("TEST", None)
+    assert result["passed"] is True
+    assert result["evidence_provider"] == "filing-derived-yfinance"
+    assert result["backlog_value"] == 80
