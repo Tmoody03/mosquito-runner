@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hmac,json,math,os,tempfile,threading,time
 from collections import defaultdict,deque
-from datetime import datetime,timezone
+from datetime import date,datetime,timedelta,timezone
 from functools import wraps
 from pathlib import Path
 from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
@@ -10,12 +10,14 @@ from strategy import build_watchlist
 import simulator
 import engine
 from protection import protected_state
+from lifecycle import Lifecycle
+from scheduler import MarketScheduler
 
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
 LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
-ENGINE_THREAD=None;ENGINE_THREAD_LOCK=threading.Lock()
+ENGINE_THREAD=None;ENGINE_THREAD_LOCK=threading.Lock();SCHEDULER_THREAD=None;SCHEDULER_THREAD_LOCK=threading.Lock();RUNTIME_STOP=threading.Event()
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"daily_goal":500.0,"running":False,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
@@ -23,9 +25,10 @@ def enabled(): return truthy("ALPACA_ENABLE_ORDER_EXECUTION")
 def engine_loop():
     while True:
         try:
-            if load_state().get("running") and enabled():engine.cycle(client(),submit_enabled=True)
+            if load_state().get("running"):
+                broker=client();life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life)
         except Exception as exc:app.logger.warning("trailing engine cycle failed: %s",type(exc).__name__)
-        time.sleep(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5))
+        if RUNTIME_STOP.wait(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5)):break
 def ensure_engine():
     global ENGINE_THREAD
     with ENGINE_THREAD_LOCK:
@@ -38,6 +41,77 @@ def client():
     if not key or not secret: raise RuntimeError("missing credentials")
     from alpaca.trading.client import TradingClient
     return TradingClient(key,secret,paper=paper())
+class PaperBrokerAdapter:
+    paper=True
+    def __init__(self,broker):self.broker=broker
+    def submit_order(self,request):
+        from alpaca.trading.enums import OrderSide,OrderType,TimeInForce
+        from alpaca.trading.requests import MarketOrderRequest
+        if str(request.get("side")).lower()!="buy":raise RuntimeError("paper lifecycle accepts buy orders only")
+        order=MarketOrderRequest(symbol=request["symbol"],notional=float(request["notional"]),side=OrderSide.BUY,type=OrderType.MARKET,time_in_force=TimeInForce.DAY,client_order_id=request["client_order_id"])
+        return self.broker.submit_order(order_data=order)
+    def get_order_by_client_id(self,client_id):
+        try:return self.broker.get_order_by_client_id(client_id)
+        except Exception:return None
+class BrokerClock:
+    def __init__(self,broker):self.broker=broker
+    def now(self):return getattr(self.broker.get_clock(),"timestamp",None) or datetime.now(timezone.utc)
+    def is_market_open(self):return bool(getattr(self.broker.get_clock(),"is_open",False))
+def lifecycle_for(broker):
+    minutes=max(0,number(os.getenv("MOSQUITO_REBUY_COOLDOWN_MINUTES")) or 5)
+    return Lifecycle(PaperBrokerAdapter(broker),os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json"),BrokerClock(broker),portfolio_size=50,rebuy_cooldown=timedelta(minutes=minutes))
+def reconcile_closed_positions(broker,life):
+    data=engine.load();changed=False;closed=[]
+    for event in data.get("events",[]):
+        if event.get("type")!="POSITION_CLOSED_PENDING_RECONCILIATION" or event.get("reconciled"):continue
+        order_id=event.get("order_id")
+        if not order_id:continue
+        try:order=broker.get_order_by_id(order_id)
+        except Exception:continue
+        status=str(getattr(order,"status","")).lower();price=number(getattr(order,"filled_avg_price",None));qty=number(getattr(order,"filled_qty",None))
+        if status=="filled" and price and qty:
+            life.record_exit(event["symbol"],fill_price=price,filled_at=getattr(order,"filled_at",None));event.update(reconciled=True,sell_price=price,filled_qty=qty,reconciled_at=now());closed.append(event["symbol"]);changed=True
+    if changed:
+        engine.save(data)
+        try:
+            picks=tradable_picks(broker,60);prices={p["ticker"]:p["price"] for p in picks};bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
+            life.rebalance(picks,prices,bp,dead_symbols=())
+        except Exception as exc:app.logger.warning("replacement cycle failed: %s",type(exc).__name__)
+    return closed
+def tradable_picks(broker,count=50):
+    from alpaca.trading.enums import AssetClass,AssetStatus
+    from alpaca.trading.requests import GetAssetsRequest
+    watch=build_watchlist(min(250,200+count));assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
+    tradable={str(getattr(a,"symbol","")).upper() for a in assets if bool(getattr(a,"tradable",False)) and bool(getattr(a,"fractionable",False))}
+    picks=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
+    if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
+    for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
+    return picks
+def orchestrate_open(*,session_date,idempotency_key,paper_only):
+    if not paper_only or not paper():raise RuntimeError("paper-only launch required")
+    state=load_state()
+    if not state.get("armed",True):return {"session_date":session_date,"status":"disarmed","paper_only":True}
+    broker=client();account=account_data();bp=number(account.get("buying_power")) or 0;requested=number(state.get("requested_investment")) or min(50000,bp);allocation=min(requested,bp)
+    if allocation<=0:raise RuntimeError("No paper buying power is available")
+    picks=tradable_picks(broker,100);life=lifecycle_for(broker);current=life.reconcile()
+    if not current.get("positions") and not current.get("orders"):
+        result=life.enter(picks,allocation)
+    else:
+        selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
+        result=life.rebalance(picks,prices,bp,dead_symbols=dead)
+    state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
+    return {"session_date":session_date,"idempotency_key":idempotency_key,"selected":50,"eligible_candidates":len(picks),"orders":len(result.get("orders",{})),"allocation":allocation,"paper_only":True}
+def broker_calendar(*,start,end):
+    from alpaca.trading.requests import GetCalendarRequest
+    return client().get_calendar(GetCalendarRequest(start=date.fromisoformat(start),end=date.fromisoformat(end)))
+def scheduler_instance():return MarketScheduler(lambda:client().get_clock(),broker_calendar,orchestrate_open,state_path=os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"),paper_only=True)
+def ensure_scheduler():
+    global SCHEDULER_THREAD
+    with SCHEDULER_THREAD_LOCK:
+        if SCHEDULER_THREAD is None or not SCHEDULER_THREAD.is_alive():
+            scheduler=scheduler_instance();SCHEDULER_THREAD=threading.Thread(target=scheduler.run_forever,args=(RUNTIME_STOP,),kwargs={"poll_seconds":15},name="mosquito-market-scheduler",daemon=True);SCHEDULER_THREAD.start()
+def ensure_runtime():
+    if truthy("MOSQUITO_RUNTIME_ENABLED") or bool(os.getenv("RAILWAY_ENVIRONMENT")):ensure_engine();ensure_scheduler()
 def serial(v):
     if v is None or isinstance(v,(str,bool,int,float)): return v
     if isinstance(v,datetime): return v.isoformat()
@@ -89,6 +163,7 @@ def authorized():
     return bool(supplied) and hmac.compare_digest(supplied,expected)
 @app.before_request
 def protect():
+    ensure_runtime()
     if request.path.startswith("/api/") and not authorized():return error("Unauthorized",401)
 @app.after_request
 def headers(response):
@@ -242,14 +317,24 @@ def dashboard_data():
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
         orders=[serial(o) for o in client().get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED,limit=100))]
-        today=datetime.now(timezone.utc).date();filled=[]
+        today=datetime.now(timezone.utc).date();filled=[];all_filled=[]
         for order in orders:
             stamp=order.get("filled_at")
             try:is_today=datetime.fromisoformat(str(stamp).replace("Z","+00:00")).astimezone(timezone.utc).date()==today
             except (TypeError,ValueError):is_today=False
-            if is_today and order.get("filled_qty") not in (None,"0",0):filled.append(order)
-        r["trades"]=[{"symbol":o.get("symbol"),"side":o.get("side"),"qty":o.get("filled_qty"),"price":o.get("filled_avg_price"),"timestamp":o.get("filled_at"),"status":o.get("status")} for o in filled]
+            if order.get("filled_qty") not in (None,"0",0):
+                all_filled.append(order)
+                if is_today:filled.append(order)
+        r["trades"]=[{"symbol":o.get("symbol"),"side":o.get("side"),"qty":o.get("filled_qty"),"price":o.get("filled_avg_price"),"timestamp":o.get("filled_at"),"status":o.get("status")} for o in all_filled]
         r["trades_today"]=len(filled)
+        try:
+            retired=lifecycle_for(client())._load().get("retired",{});wins=0
+            for symbol,lot in retired.items():
+                if not lot.get("exit_price"):continue
+                r["trades"].extend([{"symbol":symbol,"side":"buy","qty":lot.get("qty"),"price":lot.get("entry_price"),"timestamp":lot.get("entry_at"),"status":"filled"},{"symbol":symbol,"side":"sell","qty":lot.get("qty"),"price":lot.get("exit_price"),"timestamp":lot.get("exited_at"),"status":"filled"}])
+                if number(lot.get("exit_price"))>=number(lot.get("entry_price")):wins+=1
+            r["win_rate"]=(wins/len(retired)*100) if retired else None
+        except Exception:r["errors"].append("lifecycle_history")
     except Exception:r["errors"].append("orders")
     try:
         from alpaca.trading.requests import GetPortfolioHistoryRequest
@@ -294,7 +379,7 @@ def start():
         try:save_state(s)
         except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
         return upstream(exc)
-    already=bool(s["running"]);s.update(running=True,allocation=allocation,last_error=None)
+    already=bool(s["running"]);s.update(running=True,armed=True,allocation=allocation,last_error=None)
     simulation=None
     if truthy("MOSQUITO_ENABLE_SIMULATION"):
         try:simulation=simulator.begin(allocation)
@@ -305,12 +390,12 @@ def start():
         app.logger.error("state persistence failure: %s",type(exc).__name__)
         return error("Bot state could not be saved",500)
     with LOCK:CACHE.clear()
-    ensure_engine()
+    ensure_runtime()
     return jsonify(ok=True,running=True,already_running=already,allocation=allocation,requested_allocation=req,capped=allocation<req,execution_enabled=enabled(),simulation_enabled=bool(simulation),mode="paper" if paper() else "live",timestamp=now())
 @app.post("/api/bot/stop")
 @rate_limit()
 def stop():
-    s=load_state();already=not bool(s["running"]);s["running"]=False
+    s=load_state();already=not bool(s["running"]);s.update(running=False,armed=False)
     if truthy("MOSQUITO_ENABLE_SIMULATION"):simulator.stop()
     try:save_state(s)
     except OSError as exc:

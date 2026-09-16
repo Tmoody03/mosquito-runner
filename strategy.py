@@ -4,40 +4,98 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Public, non-OTC AI infrastructure universe. The three-year data rule is enforced below.
-AI_UNIVERSE = sorted(set("""
-AAPL AMD AMAT ANET ASML AVGO CDNS CLS COHR CRDO CRM CSCO DELL EQIX FSLR GEV GLW
-GOOG GOOGL HPE IBM INTC LITE LRCX META MRVL MSFT MU NBIS NEE NFLX NOW NVDA NXPI
-ORCL PANW PLTR QCOM ROK ROP SMCI SNPS TSM VRT WDC WDAY ZS
-""".split()))
+# Broad exposure themes, not a claim that every company is an AI pure-play.
+AI_UNIVERSE_BY_CATEGORY = {
+    "compute_semiconductors": """AMD ARM ASML AVGO INTC MRVL MU NVDA NXPI ON QCOM TSM TXN ADI MCHP MPWR SWKS QRVO LSCC ALGM MTSI SITM CRUS POWI ACLS AMBA RMBS WOLF STM UMC HIMX GFS COHU FORM INDI DIOD SYNA SLAB SMTC IPGP PI AEHR NVMI CAMT""".split(),
+    "semiconductor_equipment_design": """AMAT KLAC LRCX TER ENTG MKSI ICHR AOSL COHR PLAB VECO ASYS KLIC UCTT CDNS SNPS ANSS KEYS ADSK PTC ALTR FN JBL FLEX SANM CLS BHE TTMI""".split(),
+    "cloud_data_software": """AAPL AMZN GOOG GOOGL META MSFT ORCL IBM CRM NOW ADBE INTU SAP UBER ABNB PLTR SNOW DDOG MDB NET ESTC CFLT PATH AI BBAI SOUN TEM APP GTLB TEAM HUBS TWLO DOCU ZM OKTA IOT PCOR DUOL KVYO S FROG NCNO BOX DBX DOCN WDAY ROP""".split(),
+    "networking_storage_datacenters": """ANET CSCO HPE DELL SMCI VRT EQIX DLR AMT CCI GLW LITE CIEN INFN CALX NTAP PSTG WDC STX CRDO AAOI COMM UI RBBN VIAV JABIL APH TEL MSI FFIV AKAM ZBRA IRM DBRG COR AMKR WTS NBIS""".split(),
+    "security_data_observability": """PANW CRWD FTNT ZS CYBR CHKP GEN TENB VRNS RPD QLYS SAIL CACI LDOS SAIC DT INFA OS PNFP""".split(),
+    "power_cooling_industrial_robotics": """GEV NEE CEG VST ETN PWR HUBB EMR ROK HON GE PH CAT DE ABB FANUY YASKY DY IR AME ITT CARR JCI TT FIX GWW FAST URI GNRC BEPC CWEN AES EIX DUK SO EXC D NRG LEU CCJ BWXT SMR OKLO NVT MOD LIN APD ECL FSLR""".split(),
+    "autonomy_mobility_space": """TSLA MBLY AUR LAZR INVZ OUST JOBY ACHR LUNR RKLB AVAV KTOS TDY NOC LMT RTX BA TXT GD HII HEI SPR GRMN TRMB PCAR CMI GM F RIVN LI XPEV NIO""".split(),
+    "medical_healthcare_ai": """ABT ABBV ALNY AMGN BDX BMY BSX CAH CI CNC CVS DXCM EW GILD HCA HOLX HUM IDXX ILMN INCY ISRG JNJ LH LLY MDT MRNA MRK NTRA PFE REGN RMD RPRX SYK TMO UNH VEEV VRTX WAT ZBH ZTS GH EXAS PACB RXRX SDGR CERT DOCS HIMS OSCR TDOC DHR IQV TECH CRL A WST COO PODD MASI PEN ALGN STE GEHC PHG NVS AZN SNY TAK BGNE BMRN BIIB NBIX IONS QDEL DGX ELV MOH HQY RGEN RVTY OPCH""".split(),
+}
+AI_UNIVERSE = sorted({ticker for tickers in AI_UNIVERSE_BY_CATEGORY.values() for ticker in tickers})
+MIN_HISTORY_DAYS = 1000
+DOWNLOAD_BATCH_SIZE = 80
 
 
 def _feature_frame(close, volume):
     latest = close.iloc[-1]
     returns = {n: latest / close.iloc[-n] - 1 for n in (22, 66, 132, 252)}
-    breakout = latest / close.tail(252).max() - 1
-    rel_volume = volume.tail(22).mean() / volume.tail(66).mean() - 1
-    quality = close.pct_change().tail(252).mean() / close.pct_change().tail(252).std()
-    raw = pd.DataFrame({"momentum_1m": returns[22], "momentum_3m": returns[66],
-                        "momentum_6m": returns[132], "momentum_12m": returns[252],
-                        "breakout": breakout, "relative_volume": rel_volume, "quality": quality})
+    daily = close.pct_change(fill_method=None).tail(252)
+    raw = pd.DataFrame({
+        "momentum_1m": returns[22], "momentum_3m": returns[66],
+        "momentum_6m": returns[132], "momentum_12m": returns[252],
+        "breakout": latest / close.tail(252).max() - 1,
+        "relative_volume": volume.tail(22).mean() / volume.tail(66).mean() - 1,
+        "quality": daily.mean() / daily.std(),
+    })
     return raw.replace([np.inf, -np.inf], np.nan).dropna()
 
 
-def _rank01(s):
-    return s.rank(pct=True).fillna(0.5)
+def _rank01(series):
+    return series.rank(pct=True).fillna(0.5)
+
+
+def _extract_field(data, field, requested):
+    if data.empty:
+        return pd.DataFrame()
+    if isinstance(data.columns, pd.MultiIndex):
+        if field in data.columns.get_level_values(0):
+            result = data[field]
+        elif field in data.columns.get_level_values(-1):
+            result = data.xs(field, axis=1, level=-1)
+        else:
+            return pd.DataFrame(index=data.index)
+    elif field in data.columns and len(requested) == 1:
+        result = data[[field]].rename(columns={field: requested[0]})
+    else:
+        return pd.DataFrame(index=data.index)
+    if isinstance(result, pd.Series):
+        result = result.to_frame(name=requested[0])
+    result.columns = [str(column).upper() for column in result.columns]
+    return result.loc[:, ~result.columns.duplicated()]
+
+
+def _download_universe(tickers):
+    closes, volumes = [], []
+    for start in range(0, len(tickers), DOWNLOAD_BATCH_SIZE):
+        batch = tickers[start:start + DOWNLOAD_BATCH_SIZE]
+        try:
+            data = yf.download(batch, period="5y", interval="1d", auto_adjust=True,
+                               progress=False, group_by="column", threads=True)
+        except Exception:
+            continue
+        close = _extract_field(data, "Close", batch)
+        volume = _extract_field(data, "Volume", batch)
+        common = close.columns.intersection(volume.columns)
+        if len(common):
+            closes.append(close[common]); volumes.append(volume[common])
+    if not closes:
+        raise RuntimeError("Market data is temporarily unavailable")
+    close = pd.concat(closes, axis=1).sort_index()
+    volume = pd.concat(volumes, axis=1).reindex(close.index)
+    return close.loc[:, ~close.columns.duplicated()], volume.loc[:, ~volume.columns.duplicated()]
+
+
+def _category_for(ticker):
+    return next((category for category, tickers in AI_UNIVERSE_BY_CATEGORY.items()
+                 if ticker in tickers), "other")
 
 
 def build_watchlist(count=50):
-    data = yf.download(AI_UNIVERSE, period="5y", interval="1d", auto_adjust=True,
-                       progress=False, group_by="column", threads=True)
-    if data.empty:
-        raise RuntimeError("Market data is temporarily unavailable")
-    close, volume = data["Close"], data["Volume"]
-    eligible = [t for t in close.columns if close[t].dropna().shape[0] >= 756]
-    clean_close=close[eligible].ffill();latest=clean_close.iloc[-1]
+    count = max(1, min(int(count), len(AI_UNIVERSE)))
+    close, volume = _download_universe(AI_UNIVERSE)
+    eligible = [ticker for ticker in close.columns
+                if close[ticker].dropna().shape[0] >= MIN_HISTORY_DAYS]
+    if not eligible:
+        raise RuntimeError("No stocks met the four-year price-history requirement")
+    clean_close = close[eligible].ffill()  # no backfill from future observations
+    latest = clean_close.iloc[-1]
     frame = _feature_frame(clean_close, volume[eligible].fillna(0))
-    # Reconstructed, explicit V5.8 feature blend. No future holding-period data is used.
+    if frame.empty:
+        raise RuntimeError("Insufficient valid market history to rank stocks")
     frame["teddy_score"] = (0.10*_rank01(frame.momentum_1m)+0.15*_rank01(frame.momentum_3m)+
                             0.25*_rank01(frame.momentum_6m)+0.20*_rank01(frame.momentum_12m)+
                             0.12*_rank01(frame.breakout)+0.08*_rank01(frame.relative_volume)+
@@ -45,9 +103,13 @@ def build_watchlist(count=50):
     picks = frame.sort_values("teddy_score", ascending=False).head(count)
     positive_signal = float(frame.momentum_1m.median()) > 0
     april_gate = datetime.now(timezone.utc).month != 4 or positive_signal
-    rows = [{"rank": i+1, "ticker": ticker, "score": round(float(row.teddy_score)*100, 2),
-             "weight_pct": round(100/len(picks), 6), "price": round(float(latest[ticker]), 6)} for i, (ticker, row) in enumerate(picks.iterrows())]
+    rows = [{"rank": i+1, "ticker": ticker, "category": _category_for(ticker),
+             "score": round(float(row.teddy_score)*100, 2),
+             "weight_pct": round(100/len(picks), 6),
+             "price": round(float(latest[ticker]), 6)}
+            for i, (ticker, row) in enumerate(picks.iterrows())]
     return {"strategy": "V5.8 Master", "count": len(rows), "picks": rows,
+            "eligible_count": len(frame), "universe_count": len(AI_UNIVERSE),
             "positive_signal": positive_signal, "april_trade_allowed": april_gate,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "notice": "Research and Alpaca paper-preview only. Verify Fidelity tradability before orders."}
+            "notice": "Broad AI, infrastructure, and medical-AI exposure themes—not pure-play claims. Alpaca paper trading only."}
