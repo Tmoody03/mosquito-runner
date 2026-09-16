@@ -107,12 +107,18 @@ class Lifecycle:
         client_id = self._client_id(purpose, symbol, generation)
         if client_id in state["orders"]:
             return state["orders"][client_id]
-        request = {"symbol": symbol, "notional": round(float(notional), 2),
-                   "side": "buy", "type": "market", "time_in_force": "day",
-                   "client_order_id": client_id}
-        order = self.broker.submit_order(request)
+        order = self.broker.get_order_by_client_id(client_id)
+        if order is None:
+            request = {"symbol": symbol, "notional": round(float(notional), 2),
+                       "side": "buy", "type": "market", "time_in_force": "day",
+                       "client_order_id": client_id}
+            order = self.broker.submit_order(request)
+        else:
+            request = {"notional": round(float(notional), 2)}
+        raw_status=getattr(order,"status","submitted")
+        status=str(getattr(raw_status,"value",raw_status))
         row = {"client_order_id": client_id, "broker_order_id": str(getattr(order, "id", "")),
-               "symbol": symbol, "purpose": purpose, "status": str(getattr(order, "status", "submitted")),
+               "symbol": symbol, "purpose": purpose, "status": status,
                "requested_notional": request["notional"], "submitted_at": _iso(self._now()),
                "filled_qty": 0.0, "filled_avg_price": None}
         state["orders"][client_id] = row
@@ -178,7 +184,8 @@ class Lifecycle:
             remote = self.broker.get_order_by_client_id(client_id)
             if remote is None:
                 continue
-            status = str(getattr(remote, "status", local["status"]))
+            raw_status=getattr(remote,"status",local["status"])
+            status=str(getattr(raw_status,"value",raw_status))
             qty = float(getattr(remote, "filled_qty", 0) or 0)
             price_raw = getattr(remote, "filled_avg_price", None)
             price = float(price_raw) if price_raw not in (None, "") else None
