@@ -10,6 +10,7 @@ import pytest
 class FakeClient:
     def __init__(self):
         self.closed = 0
+        self.submitted = []
     def get_account(self):
         return SimpleNamespace(id="acct", status="ACTIVE", currency="USD", cash="8000",
             portfolio_value="10000", equity="10000", last_equity="9900", buying_power="12000",
@@ -17,7 +18,7 @@ class FakeClient:
             transfers_blocked=False, account_blocked=False, pattern_day_trader=False, daytrade_count=0)
     def get_all_positions(self):
         return [SimpleNamespace(asset_id="a",symbol="NVDA",exchange="NASDAQ",asset_class="us_equity",
-            qty="2",side="long",market_value="300",cost_basis="250",unrealized_pl="50",
+            qty="2",side="long",market_value="300",cost_basis="250",avg_entry_price="125",unrealized_pl="50",
             unrealized_plpc=".2",current_price="150",lastday_price="145",change_today=".034")]
     def get_orders(self, filter=None):
         return [{"symbol":"NVDA","side":"buy","filled_qty":"2","filled_avg_price":"150",
@@ -28,6 +29,9 @@ class FakeClient:
     def close_all_positions(self, cancel_orders=False):
         self.closed += 1
         return [{"symbol":"NVDA","status":"accepted","cancel_orders":cancel_orders}]
+    def submit_order(self, order_data=None):
+        self.submitted.append(order_data)
+        return SimpleNamespace(id="order-1", status="accepted")
 
 
 @pytest.fixture()
@@ -135,35 +139,33 @@ def test_exit_calls_paper_broker_only_with_gate(api, monkeypatch):
     assert r.status_code == 202 and r.json["executed"] is True and r.json["mode"] == "paper"
     assert r.json["submitted"] is True and r.json["completed"] is False
     assert r.json["status"] == "pending" and module.load_state()["exit_status"] == "pending"
-    assert fake.closed == 1
+    assert fake.closed == 0 and len(fake.submitted) == 1
     replay = c.post("/api/bot/exit", json={"confirm":"EXIT ALL POSITIONS","request_id":"exit-1"})
     assert replay.status_code == 202 and replay.json["request_id"] == "exit-1"
-    assert fake.closed == 1
+    assert fake.closed == 0 and len(fake.submitted) == 1
 
 
 def test_exit_records_broker_failure_without_claiming_completion(api, monkeypatch):
     module, c, fake = api
     monkeypatch.setenv("ALPACA_ENABLE_ORDER_EXECUTION", "true")
-    def fail_close(cancel_orders=False):
-        fake.closed += 1
+    def fail_close(order_data=None):
         raise RuntimeError("secret broker detail")
-    fake.close_all_positions = fail_close
+    fake.submit_order = fail_close
     r = c.post("/api/bot/exit", json={"confirm":"EXIT ALL POSITIONS"})
-    assert r.status_code == 503 and "secret" not in r.get_data(as_text=True)
+    assert r.status_code == 502 and "secret" not in r.get_data(as_text=True)
     state = module.load_state()
-    assert state["running"] is False and state["exit_status"] == "failed"
-    assert fake.closed == 1
+    assert state["running"] is False and state["exit_status"] == "partial_failure"
+    assert fake.closed == 0
 
 
 def test_exit_reports_partial_rejections(api, monkeypatch):
     module, c, fake = api
     monkeypatch.setenv("ALPACA_ENABLE_ORDER_EXECUTION", "true")
-    fake.close_all_positions = lambda cancel_orders=False: [
-        {"symbol":"NVDA","status":200}, {"symbol":"AMD","status":500,"body":"rejected"}]
+    fake.submit_order = lambda order_data=None: (_ for _ in ()).throw(RuntimeError("rejected"))
     r = c.post("/api/bot/exit", json={"confirm":"EXIT ALL POSITIONS"})
     assert r.status_code == 502 and r.json["ok"] is False
     assert r.json["status"] == "partial_failure" and r.json["completed"] is False
-    assert r.json["failures"][0]["symbol"] == "AMD"
+    assert r.json["failures"][0]["symbol"] == "NVDA"
     assert module.load_state()["exit_status"] == "partial_failure"
 
 
@@ -247,3 +249,41 @@ def test_simulator_never_voluntarily_sells_below_purchase(tmp_path,monkeypatch):
     assert [p["symbol"] for p in saved["positions"]]==["LOSS"]
     assert saved["cash"]==1100 and report["blocked_below_purchase"]==["LOSS"]
     assert report["completed"] is False
+
+
+def test_trailing_rule_arms_at_gain_and_never_signals_below_entry():
+    from protection import protected_state
+    rising=protected_state(100,110.70)
+    assert rising["peak_price"]==110.70 and not rising["should_sell"]
+    triggered=protected_state(100,110.42,previous_peak=rising["peak_price"])
+    assert triggered["should_sell"] is True
+    assert triggered["protected_floor"]==100
+    protected=protected_state(100,90,previous_peak=110.70)
+    assert protected["should_sell"] is False
+    assert protected["status"]=="PROTECTED_BELOW_ENTRY"
+
+
+def test_broker_exit_holds_position_below_purchase(api, monkeypatch):
+    module,c,fake=api
+    monkeypatch.setenv("ALPACA_ENABLE_ORDER_EXECUTION","true")
+    fake.get_all_positions=lambda:[SimpleNamespace(symbol="LOSS",qty="2",avg_entry_price="125",current_price="100")]
+    r=c.post("/api/bot/exit",json={"confirm":"EXIT ALL POSITIONS"})
+    assert r.status_code==409 and r.json["status"]=="partially_blocked"
+    assert r.json["blocked_below_purchase"][0]["symbol"]=="LOSS"
+    assert fake.submitted==[] and fake.closed==0
+
+
+def test_engine_persists_peak_and_submits_one_protected_sell(tmp_path,monkeypatch):
+    import engine
+    monkeypatch.setattr(engine,"PATH",tmp_path/"engine.json")
+    fake=FakeClient()
+    fake.get_all_positions=lambda:[SimpleNamespace(symbol="NVDA",qty="2",avg_entry_price="100",current_price="110.70")]
+    first=engine.cycle(fake,submit_enabled=True)
+    assert first["positions"]["NVDA"]["peak_price"]==110.70 and fake.submitted==[]
+    fake.get_all_positions=lambda:[SimpleNamespace(symbol="NVDA",qty="2",avg_entry_price="100",current_price="110.42")]
+    second=engine.cycle(fake,submit_enabled=True)
+    row=second["positions"]["NVDA"]
+    assert row["pending_order_id"]=="order-1" and len(fake.submitted)==1
+    assert float(fake.submitted[0].limit_price)>=100
+    engine.cycle(fake,submit_enabled=True)
+    assert len(fake.submitted)==1

@@ -2,12 +2,14 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py strategy.py simulator.py ./
+COPY app.py strategy.py simulator.py protection.py engine.py ./
 COPY templates ./templates
 COPY static ./static
 RUN useradd --create-home --uid 10001 mosquito && mkdir -p /data && chown -R mosquito:mosquito /app /data
 ENV PORT=8080
 ENV MOSQUITO_STATE_FILE=/data/mosquito-runner-state.json
+ENV MOSQUITO_SIM_FILE=/data/mosquito-simulation.json
+ENV MOSQUITO_ENGINE_FILE=/data/mosquito-engine.json
 EXPOSE 8080
 # Railway mounts volumes after the image is built, so the build-time /data
 # ownership can be replaced by root ownership. Repair it at container start,

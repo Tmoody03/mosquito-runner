@@ -8,15 +8,29 @@ from pathlib import Path
 from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
 from strategy import build_watchlist
 import simulator
+import engine
+from protection import protected_state
 
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
 LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
+ENGINE_THREAD=None;ENGINE_THREAD_LOCK=threading.Lock()
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
 DEFAULTS={"allocation":0.0,"requested_investment":0.0,"daily_goal":500.0,"running":False,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
-def paper(): return not(truthy("ALPACA_LIVE_TRADING") and truthy("ALPACA_ENABLE_ORDER_EXECUTION"))
+def paper(): return True
 def enabled(): return truthy("ALPACA_ENABLE_ORDER_EXECUTION")
+def engine_loop():
+    while True:
+        try:
+            if load_state().get("running") and enabled():engine.cycle(client(),submit_enabled=True)
+        except Exception as exc:app.logger.warning("trailing engine cycle failed: %s",type(exc).__name__)
+        time.sleep(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5))
+def ensure_engine():
+    global ENGINE_THREAD
+    with ENGINE_THREAD_LOCK:
+        if ENGINE_THREAD is None or not ENGINE_THREAD.is_alive():
+            ENGINE_THREAD=threading.Thread(target=engine_loop,name="mosquito-trailing-engine",daemon=True);ENGINE_THREAD.start()
 def credentials():
     return (os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID"),os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY"))
 def client():
@@ -134,8 +148,19 @@ def account():
     try:return jsonify(cached("account",10,account_data))
     except Exception as exc:return upstream(exc)
 def position_rows():
-    fields=("asset_id","symbol","exchange","asset_class","qty","side","market_value","cost_basis","unrealized_pl","unrealized_plpc","current_price","lastday_price","change_today")
-    return [{f:serial(getattr(p,f,None)) for f in fields} for p in client().get_all_positions()]
+    fields=("asset_id","symbol","exchange","asset_class","qty","side","market_value","cost_basis","unrealized_pl","unrealized_plpc","current_price","lastday_price","change_today","avg_entry_price")
+    rows=[];tracked={p["symbol"]:p for p in engine.public_state()["positions"]}
+    for p in client().get_all_positions():
+        row={f:serial(getattr(p,f,None)) for f in fields}
+        qty=number(row.get("qty")); entry=number(row.get("avg_entry_price")); current=number(row.get("current_price")); cost=number(row.get("cost_basis"))
+        if entry is None and qty not in (None,0) and cost is not None:entry=cost/qty
+        if entry and current:
+            guard=protected_state(entry,current,tracked.get(str(row.get("symbol")),{}).get("peak_price"))
+            row.update({k:round(v,6) if isinstance(v,float) else v for k,v in guard.items()})
+        rows.append(row)
+    return rows
+@app.get("/api/engine")
+def engine_status():return jsonify(engine.public_state())
 @app.get("/api/positions")
 def positions():
     try:r=cached("positions",8,position_rows);return jsonify(positions=r,count=len(r),timestamp=now())
@@ -280,6 +305,7 @@ def start():
         app.logger.error("state persistence failure: %s",type(exc).__name__)
         return error("Bot state could not be saved",500)
     with LOCK:CACHE.clear()
+    ensure_engine()
     return jsonify(ok=True,running=True,already_running=already,allocation=allocation,requested_allocation=req,capped=allocation<req,execution_enabled=enabled(),simulation_enabled=bool(simulation),mode="paper" if paper() else "live",timestamp=now())
 @app.post("/api/bot/stop")
 @rate_limit()
@@ -327,19 +353,32 @@ def exit_bot():
             except OSError as exc:app.logger.error("state persistence failure: %s",type(exc).__name__)
             return jsonify(ok=False,running=False,executed=False,submitted=False,completed=False,
                 status="blocked",message="Exit was not submitted because broker execution is disabled",timestamp=now()),409
-        result=client().close_all_positions(cancel_orders=True)
-        rows=serial(result); rows=rows if isinstance(rows,list) else [rows]
-        failures=[row for row in rows if isinstance(row,dict) and isinstance(row.get("status"),int) and row["status"]>=400]
-        status="partial_failure" if failures else "pending"
-        message=("Some close requests were rejected; verify the remaining positions" if failures else
-            "Close requests were accepted by Alpaca and are pending; completion has not been verified")
+        broker=client(); positions=broker.get_all_positions(); rows=[];failures=[];blocked=[]
+        from alpaca.trading.enums import OrderSide,TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest
+        for p in positions:
+            symbol=str(getattr(p,"symbol",""));qty=number(getattr(p,"qty",None));entry=number(getattr(p,"avg_entry_price",None));current=number(getattr(p,"current_price",None))
+            if not symbol or qty is None or qty<=0 or entry is None or current is None:
+                failures.append({"symbol":symbol or "unknown","reason":"position data unavailable"});continue
+            guard=protected_state(entry,current)
+            if guard["below_entry"]:
+                blocked.append({"symbol":symbol,"qty":qty,**guard});continue
+            try:
+                order=broker.submit_order(order_data=LimitOrderRequest(symbol=symbol,qty=qty,side=OrderSide.SELL,time_in_force=TimeInForce.DAY,limit_price=guard["protected_floor"],client_order_id=f"mosquito-exit-{symbol}-{int(time.time())}"))
+                rows.append({"symbol":symbol,"qty":qty,"entry_price":entry,"current_price":current,"limit_price":guard["protected_floor"],"status":serial(getattr(order,"status","accepted")),"order_id":serial(getattr(order,"id",None)),"reason":"OWNER_PROTECTED_EXIT"})
+            except Exception:
+                failures.append({"symbol":symbol,"reason":"broker rejected protected limit order"})
+        status="partial_failure" if failures else "partially_blocked" if blocked else "pending"
+        message=("Some protected limit orders were rejected; verify the remaining positions" if failures else
+            "Profitable positions received protected limit orders; below-purchase positions remain held" if blocked else
+            "Protected limit orders were accepted by Alpaca and are pending; completion has not been verified")
         s.update(exit_status=status,last_error=message if failures else None)
         try:save_state(s)
         except OSError as exc:app.logger.error("state persistence failure: %s",type(exc).__name__)
         payload={"ok":not failures,"running":False,"executed":True,"submitted":True,"completed":False,
-            "status":status,"message":message,"results":rows,"failures":failures,
+            "status":status,"message":message,"results":rows,"failures":failures,"blocked_below_purchase":blocked,
             "mode":"paper" if paper() else "live","request_id":request_id or None,"timestamp":now()}
-        http_status=502 if failures else 202
+        http_status=502 if failures else 409 if blocked else 202
         if request_id:
             with LOCK:EXIT_RESULTS[request_id]={**payload,"http_status":http_status}
         with LOCK:CACHE.clear()
