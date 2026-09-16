@@ -20,7 +20,7 @@ RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
 BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
 BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selected_watchlist":[],"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selected_watchlist":[],"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
@@ -138,6 +138,18 @@ def tradable_picks(broker,count=50):
     if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
     return picks
+
+def qualifying_universe_picks(broker, limit=50, ranked=None):
+    """Rank the eligible AI universe, then apply today's live entry gate.
+
+    The entry gate must not be applied only to the first 50 ranked names: during a
+    mid-session launch that can leave the portfolio empty even though lower-ranked
+    AI names have already moved through the configured threshold.  Rank up to 250
+    eligible names first, gate that full pool using today's Alpaca open/latest
+    trade, and retain the best qualifying names in deterministic rank order.
+    """
+    ranked = ranked or tradable_picks(broker, 50)
+    return confirmed_entry_picks(ranked)[:max(1, min(int(limit), 50))]
 def entry_signal_met(session_open,current_price,threshold=0.001):
     """Return true only after a stock gains the required amount from today's open."""
     opened=number(session_open);current=number(current_price);threshold=number(threshold)
@@ -198,19 +210,33 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if not enabled():return {"session_date":session_date,"status":"broker_execution_disabled","orders":0,"paper_only":True}
     broker=client();account=account_data();bp=number(account.get("buying_power")) or 0;requested=number(state.get("requested_investment")) or min(50000,bp);allocation=min(requested,bp)
     if allocation<=0:raise RuntimeError("No paper buying power is available")
-    locked=list(state.get("selected_watchlist") or [])
-    if len(locked)<50:
-        ranked=tradable_picks(broker,50)[:50]
-        locked=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in ranked]
-        state.update(selected_watchlist=locked,last_scan=now(),last_error=None);save_state(state)
-    picks=locked;confirmed=confirmed_entry_picks(picks);life=lifecycle_for(broker);current=life.reconcile()
+    life=lifecycle_for(broker);current=life.reconcile()
     pending_statuses={"new","accepted","pending_new","partially_filled","submitted"}
     occupied=set(current.get("positions",{}))|{o.get("symbol") for o in current.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
+    locked=list(state.get("selected_watchlist") or [])
+    candidate_pool=list(state.get("selection_universe") or [])
+    if not candidate_pool:
+        # Migrate the pre-full-universe state safely. With no broker exposure,
+        # discard the old pre-gated 50 so qualified lower-ranked names can enter.
+        if not occupied:locked=[]
+        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in tradable_picks(broker,50)]
+    live_qualified=qualifying_universe_picks(broker,50,ranked=candidate_pool)
+    # Preserve already selected/ordered symbols and append newly qualified names
+    # in V5.8 rank order until the equal-weight Top 50 is full.
+    by_symbol={str(row.get("ticker")):dict(row) for row in locked}
+    for row in live_qualified:
+        symbol=str(row.get("ticker"))
+        if symbol and (symbol in by_symbol or len(by_symbol)<50):by_symbol[symbol]=dict(row)
+    locked=sorted(by_symbol.values(),key=lambda row:row.get("rank",10**9))[:50]
+    qualified_symbols={str(row.get("ticker")) for row in live_qualified}
+    confirmed=[row for row in locked if str(row.get("ticker")) in qualified_symbols and str(row.get("ticker")) not in occupied]
+    state.update(selection_universe=candidate_pool,selected_watchlist=locked,last_scan=now(),last_error=None);save_state(state)
+    picks=locked
     if len(occupied)<50:
         result=life.enter_available(confirmed,bp,total_budget=allocation)
         occupied=set(result.get("positions",{}))|{o.get("symbol") for o in result.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
         state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
-        if len(occupied)<50:raise RetryPending(f"Entry gate waiting: {len(occupied)}/50 locked picks have paper positions or pending orders")
+        if len(occupied)<50:raise RetryPending(f"Full-universe entry scan: {len(locked)} qualified; {len(occupied)}/50 have paper positions or pending orders")
     else:
         selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
         result=life.rebalance(confirmed,prices,bp,dead_symbols=dead)
