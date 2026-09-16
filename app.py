@@ -45,6 +45,7 @@ class PaperBrokerAdapter:
     paper=True
     def __init__(self,broker):self.broker=broker
     def submit_order(self,request):
+        if not enabled():raise RuntimeError("broker order execution is disabled")
         from alpaca.trading.enums import OrderSide,OrderType,TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
         if str(request.get("side")).lower()!="buy":raise RuntimeError("paper lifecycle accepts buy orders only")
@@ -109,6 +110,7 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if not paper_only or not paper():raise RuntimeError("paper-only launch required")
     state=load_state()
     if not state.get("armed",True):return {"session_date":session_date,"status":"disarmed","paper_only":True}
+    if not enabled():return {"session_date":session_date,"status":"broker_execution_disabled","orders":0,"paper_only":True}
     broker=client();account=account_data();bp=number(account.get("buying_power")) or 0;requested=number(state.get("requested_investment")) or min(50000,bp);allocation=min(requested,bp)
     if allocation<=0:raise RuntimeError("No paper buying power is available")
     picks=tradable_picks(broker,100);life=lifecycle_for(broker);current=life.reconcile()

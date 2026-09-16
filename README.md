@@ -47,7 +47,7 @@ Set secrets only in Railway **Variables**; never commit them.
 | `ALPACA_API_KEY` | Yes | Alpaca paper account key |
 | `ALPACA_SECRET_KEY` | Yes | Alpaca paper account secret |
 | `DASHBOARD_TOKEN` | Yes | Protects the owner dashboard and API |
-| `ALPACA_ENABLE_ORDER_EXECUTION=true` | Yes for protected paper orders | Allows submissions to the paper broker only; it cannot enable live mode |
+| `ALPACA_ENABLE_ORDER_EXECUTION=true` | Yes for all paper broker orders | Allows submissions to the paper broker only; it cannot enable live mode. When false, automatic entries and rebalances are skipped while the local simulation remains available. |
 | `MOSQUITO_ENABLE_SIMULATION=true` | Yes for the local V5.8 simulation | Enables the persistent simulated basket |
 | `MOSQUITO_ENGINE_INTERVAL=5` | Recommended | Seconds between paper-account monitor cycles; minimum effective value is 2 |
 
