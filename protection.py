@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-TRAILING_DROP = 0.0025
+TRAILING_DROP = 0.001
 
 
 def money_tick_up(value: float) -> float:
@@ -15,7 +15,7 @@ def money_tick_up(value: float) -> float:
 
 
 def protected_state(entry: float, current: float, previous_peak: float | None = None) -> dict:
-    """Evaluate the 0.25% trail without ever authorizing a loss sale."""
+    """Evaluate the 0.10% trail without ever authorizing a loss sale."""
     entry, current = float(entry), float(current)
     values = (entry, current)
     if any(not math.isfinite(v) or v <= 0 for v in values):

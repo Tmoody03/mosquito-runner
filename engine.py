@@ -74,7 +74,7 @@ def cycle(broker, submit_enabled=False):
         if guard["should_sell"] and submit_enabled and not row["pending_order_id"]:
             request=LimitOrderRequest(symbol=symbol,qty=qty,side=OrderSide.SELL,time_in_force=TimeInForce.DAY,limit_price=guard["protected_floor"],client_order_id=f"mosquito-trail-{symbol}-{int(entry*100)}-{int(time.time())}")
             order=broker.submit_order(order_data=request)
-            row["pending_order_id"]=str(getattr(order,"id","submitted"));row["sell_reason"]="TRAIL_0.25_PERCENT_PROTECTED"
+            row["pending_order_id"]=str(getattr(order,"id","submitted"));row["sell_reason"]="TRAIL_0.10_PERCENT_PROTECTED"
             events.append({"type":"SELL_SUBMITTED","symbol":symbol,"qty":qty,"buy_price":entry,"trigger_price":guard["trailing_trigger"],"limit_price":guard["protected_floor"],"peak_price":guard["peak_price"],"order_id":row["pending_order_id"],"timestamp":_now()})
         fresh[symbol]=row
     closed=set(old)-set(fresh)

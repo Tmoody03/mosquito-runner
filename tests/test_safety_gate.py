@@ -57,12 +57,12 @@ def test_no_sale_below_entry_even_after_large_prior_gain():
     assert guard["protected_floor"] == 100.0
 
 
-def test_quarter_percent_trigger_boundary_is_inclusive():
+def test_tenth_percent_trigger_boundary_is_inclusive():
     peak = 110.0
-    trigger = peak * 0.9975
+    trigger = peak * 0.999
     assert protected_state(100.0, trigger + 0.000_002, peak)["should_sell"] is False
     at_boundary = protected_state(100.0, trigger, peak)
-    assert at_boundary["trailing_trigger"] == pytest.approx(109.725)
+    assert at_boundary["trailing_trigger"] == pytest.approx(109.89)
     assert at_boundary["should_sell"] is True
 
 
@@ -119,7 +119,7 @@ def test_pending_order_survives_restart_and_still_prevents_duplicates():
                     "entry_price": 100.0,
                     "peak_price": 110.0,
                     "pending_order_id": "existing-order",
-                    "sell_reason": "TRAIL_0.25_PERCENT_PROTECTED",
+                    "sell_reason": "TRAIL_0.10_PERCENT_PROTECTED",
                 }
             },
         }

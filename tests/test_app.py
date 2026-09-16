@@ -310,8 +310,8 @@ def test_trailing_rule_arms_at_gain_and_never_signals_below_entry():
 
 def test_entry_gate_requires_half_percent_above_session_open(api):
     module, _client, _fake = api
-    assert module.entry_signal_met(100,100.49) is False
-    assert module.entry_signal_met(100,100.50) is True
+    assert module.entry_signal_met(100,100.24,0.0025) is False
+    assert module.entry_signal_met(100,100.25,0.0025) is True
     assert module.entry_signal_met(100,101.00) is True
     assert module.entry_signal_met(0,101.00) is False
     assert module.entry_signal_met(None,101.00) is False

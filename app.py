@@ -190,7 +190,7 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if allocation<=0:raise RuntimeError("No paper buying power is available")
     picks=tradable_picks(broker,100);confirmed=confirmed_entry_picks(picks);life=lifecycle_for(broker);current=life.reconcile()
     if not current.get("positions") and not current.get("orders"):
-        if len(confirmed)<50:raise RuntimeError(f"Entry gate waiting: {len(confirmed)}/50 candidates are at least 0.50% above the session open")
+        if len(confirmed)<50:raise RuntimeError(f"Entry gate waiting: {len(confirmed)}/50 candidates passed the configured rise above session open")
         result=life.enter(confirmed,allocation)
     else:
         selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
