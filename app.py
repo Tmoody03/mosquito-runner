@@ -20,7 +20,7 @@ RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
 BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
 BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
+DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selected_watchlist":[],"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
 def paper(): return True
@@ -173,8 +173,8 @@ def alpaca_history(symbols):
     from alpaca.data.timeframe import TimeFrame
     key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
     market=StockHistoricalDataClient(key,secret);closes=[];volumes=[];start=datetime.now(timezone.utc)-timedelta(days=5*366)
-    for offset in range(0,len(symbols),60):
-        batch=symbols[offset:offset+60];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
+    for offset in range(0,len(symbols),20):
+        batch=symbols[offset:offset+20];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
         if frame is None or frame.empty:continue
         if isinstance(frame.index,pd.MultiIndex):
             closes.append(frame["close"].unstack(level="symbol"));volumes.append(frame["volume"].unstack(level="symbol"))
@@ -189,10 +189,19 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if not enabled():return {"session_date":session_date,"status":"broker_execution_disabled","orders":0,"paper_only":True}
     broker=client();account=account_data();bp=number(account.get("buying_power")) or 0;requested=number(state.get("requested_investment")) or min(50000,bp);allocation=min(requested,bp)
     if allocation<=0:raise RuntimeError("No paper buying power is available")
-    picks=tradable_picks(broker,100);confirmed=confirmed_entry_picks(picks);life=lifecycle_for(broker);current=life.reconcile()
-    if not current.get("positions") and not current.get("orders"):
-        if len(confirmed)<50:raise RuntimeError(f"Entry gate waiting: {len(confirmed)}/50 candidates passed the configured rise above session open")
-        result=life.enter(confirmed,allocation)
+    locked=list(state.get("selected_watchlist") or [])
+    if len(locked)<50:
+        ranked=tradable_picks(broker,50)[:50]
+        locked=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in ranked]
+        state.update(selected_watchlist=locked,last_scan=now(),last_error=None);save_state(state)
+    picks=locked;confirmed=confirmed_entry_picks(picks);life=lifecycle_for(broker);current=life.reconcile()
+    pending_statuses={"new","accepted","pending_new","partially_filled","submitted"}
+    occupied=set(current.get("positions",{}))|{o.get("symbol") for o in current.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
+    if len(occupied)<50:
+        result=life.enter_available(confirmed,bp,total_budget=allocation)
+        occupied=set(result.get("positions",{}))|{o.get("symbol") for o in result.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
+        state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
+        if len(occupied)<50:raise RuntimeError(f"Entry gate waiting: {len(occupied)}/50 locked picks have paper positions or pending orders")
     else:
         selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
         result=life.rebalance(confirmed,prices,bp,dead_symbols=dead)
@@ -360,7 +369,7 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    payload={"status":"ok","paper_mode":paper(),"allocation":load_state().get("requested_investment"),"running":load_state().get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.005,"trailing_drop_pct":0.10,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"selected":result.get("selected"),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
+    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.005,"trailing_drop_pct":0.10,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"selected":len(saved.get("selected_watchlist") or []),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
     try:
         payload["open_positions"]=len(client().get_all_positions())
         from alpaca.trading.enums import QueryOrderStatus
@@ -474,7 +483,7 @@ def dashboard_data():
     except Exception:r["account"]=None;r["errors"].append("account")
     try:r["positions"]=cached("positions",8,position_rows)
     except Exception:r["positions"]=None;r["errors"].append("positions")
-    r["positions_count"]=len(r["positions"]) if isinstance(r["positions"],list) else None
+    r["positions_count"]=len(r["positions"]) if isinstance(r["positions"],list) else None;r["watchlist"]=st.get("selected_watchlist") or []
     r.update(trades_today=None,win_rate=None,trades=[],performance=[])
     try:
         from alpaca.trading.enums import QueryOrderStatus

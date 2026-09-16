@@ -130,6 +130,35 @@ class Lifecycle:
         self._save(state)
         return state
 
+    def enter_available(self, picks, buying_power, *, total_budget):
+        """Submit equal-weight entries only for currently confirmed locked picks.
+
+        Unlike ``enter``, this supports a staged launch: the Top 50 is locked first,
+        and each name receives exactly one order when its live entry signal arrives.
+        """
+        self._assert_paper()
+        if not self.clock.is_market_open():
+            raise LifecycleError("market is closed")
+        ranked = self._ranked(picks)
+        state = self._load()
+        pending_statuses = {"new", "accepted", "pending_new", "partially_filled", "submitted"}
+        occupied = set(state["positions"]) | {o["symbol"] for o in state["orders"].values()
+            if str(o.get("status", "")).lower() in pending_statuses}
+        slots = max(0, self.portfolio_size - len(occupied))
+        weight = float(total_budget) / self.portfolio_size
+        available = max(0.0, float(buying_power))
+        for row in ranked:
+            if slots <= 0 or available < 1:
+                break
+            symbol = row["symbol"]
+            if symbol in occupied:
+                continue
+            notional = min(weight, available)
+            self._submit_once(state, symbol=symbol, notional=notional, purpose="entry")
+            occupied.add(symbol); slots -= 1; available -= notional
+        self._save(state)
+        return state
+
     def reconcile(self):
         """Copy actual broker fills into durable lots; never infer a fill."""
         self._assert_paper()

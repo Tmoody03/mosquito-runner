@@ -25,13 +25,15 @@ def test_open_orchestration_glues_selection_to_paper_lifecycle(api, monkeypatch)
     calls=[]
     class Life:
         def reconcile(self):return {"positions":{},"orders":{}}
-        def enter(self,selected,allocation):calls.append((selected,allocation));return {"orders":{str(i):{} for i in range(50)}}
+        def enter_available(self,selected,buying_power,*,total_budget):
+            calls.append((selected,buying_power,total_budget))
+            return {"positions":{},"orders":{str(i):{"symbol":row["ticker"],"status":"submitted"} for i,row in enumerate(selected)}}
     monkeypatch.setattr(module,"lifecycle_for",lambda _broker:Life())
     monkeypatch.setattr(module,"ensure_engine",lambda:None)
     state=module.load_state();state.update(requested_investment=50000,armed=True);module.save_state(state)
     result=module.orchestrate_open(session_date="2026-09-17",idempotency_key="open-1",paper_only=True)
     assert result["selected"]==50 and result["orders"]==50 and result["allocation"]==50000
-    assert len(calls)==1 and len(calls[0][0])==100
+    assert len(calls)==1 and len(calls[0][0])==50 and calls[0][2]==50000
     saved=module.load_state();assert saved["running"] is True and saved["armed"] is True
 
 
