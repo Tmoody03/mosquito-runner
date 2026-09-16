@@ -30,6 +30,10 @@ def picks(n=60):
              "eligible": True} for i in range(1, n+1)]
 
 
+def quote(clock, price):
+    return {"price": price, "observed_at": clock.value.isoformat()}
+
+
 def test_top_50_equal_weight_and_restart_idempotency(tmp_path):
     broker, clock = Broker(), Clock(); path = tmp_path/"life.json"
     Lifecycle(broker, path, clock).enter(picks(), 50_000)
@@ -76,23 +80,69 @@ def test_dead_name_skipped_for_next_ranked_replacement(tmp_path):
     assert broker.submitted[-1]["client_order_id"].startswith("mosquito-v58-replacement-")
 
 
-def test_rebuy_requires_cooldown_and_price_at_or_below_exit_baseline(tmp_path):
+def test_rebuy_requires_cooldown_and_renewed_upward_momentum(tmp_path):
     broker, clock = Broker(), Clock(); life = Lifecycle(broker, tmp_path/"x", clock)
     state = life._load()
     for row in picks(49):
         state["positions"][row["ticker"]] = {"symbol": row["ticker"], "qty": 1, "entry_price": 10}
     state["positions"]["AI050"] = {"symbol":"AI050", "qty":1, "entry_price":50}
     life._save(state); life.record_exit("AI050", fill_price=75)
-    life.rebalance(picks(50), {"AI050": 70}, 1000)
+    life.rebalance(picks(50), {"AI050": quote(clock, 70)}, 1000)
     assert broker.submitted == []
     clock.value += timedelta(days=1, seconds=1)
-    life.rebalance(picks(50), {"AI050": 76}, 1000)
-    assert broker.submitted == []  # rebuy above baseline rejected
+    life.rebalance(picks(50), {"AI050": quote(clock, 70)}, 1000)
+    assert broker.submitted == []  # flat watch price is not renewed momentum
 
-    # A baseline-qualified rebuy is submitted once despite repeated cycles.
+    # A renewed rise can re-enter even above the old exit; retries stay idempotent.
     state = life._load(); state["orders"] = {}; life._save(state)
-    life.rebalance(picks(50), {"AI050": 74}, 1000)
+    clock.value += timedelta(seconds=1)
+    life.rebalance(picks(50), {"AI050": quote(clock, 76)}, 1000)
+    assert broker.submitted == []
+    clock.value += timedelta(seconds=1)
+    life.rebalance(picks(50), {"AI050": quote(clock, 76.20)}, 1000)
     assert broker.submitted[-1]["symbol"] == "AI050"
+    assert broker.submitted[-1]["client_order_id"].startswith("mosquito-v58-rebuy-")
     count = len(broker.submitted)
-    life.rebalance(picks(50), {"AI050": 70}, 1000)
+    clock.value += timedelta(seconds=1)
+    life.rebalance(picks(50), {"AI050": quote(clock, 77)}, 1000)
     assert len(broker.submitted) == count
+
+
+def test_rebuy_watchlist_persists_latest_observation(tmp_path):
+    broker, clock = Broker(), Clock(); life = Lifecycle(
+        broker, tmp_path/"x", clock, portfolio_size=50,
+        rebuy_cooldown=timedelta(minutes=5), rebuy_momentum=0.0025)
+    state = life._load()
+    for row in picks(49):
+        state["positions"][row["ticker"]] = {"symbol":row["ticker"], "qty":1, "entry_price":10}
+    state["positions"]["AI050"] = {"symbol":"AI050", "qty":1, "entry_price":50}
+    life._save(state); life.record_exit("AI050", fill_price=75)
+
+    clock.value += timedelta(minutes=6)
+    life.rebalance(picks(50), {"AI050":quote(clock, 75.10)}, 1000)
+    watched = life._load()["retired"]["AI050"]
+    assert watched["watch_price"] == 75.10
+    assert watched["watch_status"] == "WATCHING"
+    assert broker.submitted == []
+
+    clock.value += timedelta(seconds=1)
+    life.rebalance(picks(50), {"AI050":quote(clock, 75.30)}, 1000)
+    assert broker.submitted == []
+    clock.value += timedelta(seconds=1)
+    life.rebalance(picks(50), {"AI050":quote(clock, 75.50)}, 1000)
+    assert broker.submitted[-1]["symbol"] == "AI050"
+    assert life._load()["retired"]["AI050"]["watch_status"] == "REENTRY_SIGNAL"
+
+
+def test_watched_runner_keeps_vacancy_from_lower_ranked_replacement(tmp_path):
+    broker, clock = Broker(), Clock(); life = Lifecycle(
+        broker, tmp_path/"x", clock, rebuy_cooldown=timedelta(minutes=5))
+    state = life._load()
+    for row in picks(49):
+        state["positions"][row["ticker"]] = {"symbol":row["ticker"], "qty":1, "entry_price":10}
+    state["positions"]["AI050"] = {"symbol":"AI050", "qty":1, "entry_price":50}
+    life._save(state); life.record_exit("AI050", fill_price=75)
+
+    # AI051 is eligible, but it must not steal the slot reserved for AI050's watch.
+    life.rebalance(picks(60), {"AI050":quote(clock, 75), "AI051":61}, 1000)
+    assert broker.submitted == []

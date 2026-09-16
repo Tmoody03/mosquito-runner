@@ -29,14 +29,22 @@ class Lifecycle:
     STRATEGY_REVISION = "green-ribbon-2026-09-16-v1"
 
     def __init__(self, broker, state_path, clock, *, portfolio_size=50,
-                 rebuy_cooldown=timedelta(days=1)):
+                 rebuy_cooldown=timedelta(days=1), rebuy_momentum=0.001,
+                 rebuy_confirmations=2, max_price_age=timedelta(seconds=90)):
         self.broker = broker
         self.path = Path(state_path)
         self.clock = clock
         self.portfolio_size = int(portfolio_size)
         self.rebuy_cooldown = rebuy_cooldown
+        self.rebuy_momentum = float(rebuy_momentum)
+        self.rebuy_confirmations = int(rebuy_confirmations)
+        self.max_price_age = max_price_age
         if self.portfolio_size != 50:
             raise LifecycleError("automated lifecycle is locked to 50 positions")
+        if self.rebuy_momentum < 0 or self.rebuy_momentum > 0.10:
+            raise LifecycleError("rebuy momentum is outside the safe range")
+        if self.rebuy_confirmations < 2:
+            raise LifecycleError("rebuy requires at least two confirmations")
 
     def _now(self):
         value = self.clock.now()
@@ -221,16 +229,21 @@ class Lifecycle:
         when = filled_at or self._now()
         state["retired"][symbol] = {**lot, "exit_price": float(fill_price),
             "baseline": float(fill_price), "exited_at": _iso(when),
+            "watch_price": float(fill_price), "watch_price_at": _iso(when),
+            "watch_status": "COOLDOWN", "upward_ticks": 0,
             "generation": int(state["retired"].get(symbol, {}).get("generation", 0)) + 1}
         self._save(state)
         return state
 
     def rebalance(self, picks, prices, buying_power, *, dead_symbols=()):
-        """Replace dead/ineligible names and allow cooled-down baseline rebuys.
+        """Replace dead/ineligible names and rebuy renewed post-exit momentum.
 
-        A sold symbol may be rebought only after the cooldown and only at or below
-        its actual exit-price baseline. Dead symbols are never selected again in
-        this cycle; the next ranked eligible candidate takes the vacant slot.
+        Every profitably sold symbol remains in the retired watch list.  Once its
+        cooldown has elapsed, a fresh price rise from the prior watch observation
+        qualifies it for re-entry.  This deliberately permits a rebuy above the
+        exit price when a runner resumes climbing; an idempotent generation key
+        prevents duplicate orders. Dead symbols are never selected again in this
+        cycle; the next ranked eligible candidate takes the vacant slot.
         """
         self._assert_paper()
         if not self.clock.is_market_open():
@@ -249,6 +262,11 @@ class Lifecycle:
                         if o["status"].lower() in pending_statuses and
                         o["symbol"] not in state["positions"]}
         vacancies = max(0, self.portfolio_size - len(active | pending_buys))
+        # Keep a sold runner's slot available while its watch signal develops.
+        # Otherwise a lower-ranked replacement would consume the vacancy during
+        # cooldown and the watched symbol could never be bought back.
+        watched = {s for s in state["retired"] if s in eligible and s not in dead
+                   and s not in active and s not in pending_buys}
         notional = float(buying_power) / vacancies if vacancies else 0
         for row in ranked:
             if vacancies <= 0:
@@ -258,15 +276,45 @@ class Lifecycle:
                 continue
             retired = state["retired"].get(symbol)
             purpose, generation = "replacement", 0
+            if not retired and watched and vacancies <= len(watched):
+                continue
             if retired:
                 exited = datetime.fromisoformat(retired["exited_at"])
+                observation = prices.get(symbol)
+                if isinstance(observation, dict):
+                    current = float(observation.get("price") or 0)
+                    observed_at = observation.get("observed_at")
+                    try:
+                        observed_at = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+                        if observed_at.tzinfo is None:
+                            observed_at = observed_at.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        observed_at = None
+                else:
+                    current, observed_at = float(observation or 0), None
+                previous = float(retired.get("watch_price") or retired["baseline"])
                 if now < exited + self.rebuy_cooldown:
+                    retired.update(watch_status="COOLDOWN", upward_ticks=0)
                     continue
-                if float(prices.get(symbol, float("inf"))) > float(retired["baseline"]):
+                prior_at = retired.get("watch_price_at")
+                prior_at = datetime.fromisoformat(prior_at) if prior_at else None
+                fresh = (observed_at is not None and observed_at <= now and
+                         now - observed_at <= self.max_price_age and
+                         (prior_at is None or observed_at > prior_at))
+                if current <= 0 or not fresh:
+                    retired["watch_status"] = "STALE_PRICE" if current > 0 else "PRICE_UNAVAILABLE"
+                    continue
+                renewed = current >= previous * (1 + self.rebuy_momentum)
+                confirmations = int(retired.get("upward_ticks", 0)) + 1 if renewed else 0
+                retired.update(watch_price=current, watch_price_at=_iso(observed_at),
+                               watch_status=("REENTRY_SIGNAL" if confirmations >= self.rebuy_confirmations
+                                             else "CONFIRMING" if renewed else "WATCHING"),
+                               upward_ticks=confirmations)
+                if confirmations < self.rebuy_confirmations:
                     continue
                 purpose, generation = "rebuy", int(retired["generation"])
             self._submit_once(state, symbol=symbol, notional=notional,
                               purpose=purpose, generation=generation)
-            pending_buys.add(symbol); vacancies -= 1
+            pending_buys.add(symbol); vacancies -= 1; watched.discard(symbol)
         self._save(state)
         return state

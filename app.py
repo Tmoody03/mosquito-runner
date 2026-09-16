@@ -48,7 +48,7 @@ def engine_loop():
     while True:
         try:
             if load_state().get("running"):
-                broker=client();life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life)
+                broker=client();life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life);scan_reentry_watchlist(broker,life)
         except Exception as exc:log_broker_error(exc,"trailing_engine_cycle")
         if RUNTIME_STOP.wait(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5)):break
 def ensure_engine():
@@ -110,6 +110,32 @@ class BrokerClock:
 def lifecycle_for(broker):
     minutes=max(0,number(os.getenv("MOSQUITO_REBUY_COOLDOWN_MINUTES")) or 5)
     return Lifecycle(PaperBrokerAdapter(broker),os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json"),BrokerClock(broker),portfolio_size=50,rebuy_cooldown=timedelta(minutes=minutes))
+def scan_reentry_watchlist(broker,life):
+    """Continuously recheck sold runners with fresh executable paper quotes."""
+    retired=life._load().get("retired",{})
+    if not retired or not enabled() or not bool(getattr(broker.get_clock(),"is_open",False)):return
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockSnapshotRequest
+    key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
+    market=StockHistoricalDataClient(key,secret);symbols=sorted(retired);snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols,feed=feed)) or {}
+    checked=datetime.now(timezone.utc);prices={}
+    for symbol in symbols:
+        snap=snapshots.get(symbol);quote=getattr(snap,"latest_quote",None);ask=number(getattr(quote,"ask_price",None));bid=number(getattr(quote,"bid_price",None));stamp=getattr(quote,"timestamp",None)
+        if not ask or not bid or not stamp:continue
+        if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
+        stamp=stamp.astimezone(timezone.utc)
+        if checked-stamp>timedelta(seconds=15) or ask<bid or (ask-bid)/ask>.002:continue
+        prices[symbol]={"price":ask,"observed_at":stamp.isoformat()}
+    if not prices:return
+    saved=load_state();locked=list(saved.get("selected_watchlist") or []);known={str(row.get("ticker") or row.get("symbol") or "").upper() for row in locked}
+    for symbol in symbols:
+        if symbol not in known:locked.append({"ticker":symbol,"rank":10**6,"score":0,"price":prices.get(symbol,{}).get("price") or retired[symbol].get("watch_price") or retired[symbol]["exit_price"],"eligible":True})
+    for row in locked:
+        symbol=str(row.get("ticker") or row.get("symbol") or "").upper()
+        if symbol in prices:row["price"]=prices[symbol]["price"]
+    bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
+    life.rebalance(locked,prices,bp,dead_symbols=())
 def reconcile_closed_positions(broker,life):
     data=engine.load();changed=False;closed=[]
     for event in data.get("events",[]):
@@ -574,7 +600,13 @@ def dashboard_data():
     except Exception:r["account"]=None;r["errors"].append("account")
     try:r["positions"]=cached("positions",8,position_rows)
     except Exception:r["positions"]=None;r["errors"].append("positions")
-    r["positions_count"]=len(r["positions"]) if isinstance(r["positions"],list) else None;r["watchlist"]=st.get("selected_watchlist") or []
+    r["positions_count"]=len(r["positions"]) if isinstance(r["positions"],list) else None;r["watchlist"]=list(st.get("selected_watchlist") or [])
+    try:
+        retired=lifecycle_for(client())._load().get("retired",{});by_symbol={str(row.get("ticker") or row.get("symbol") or "").upper():row for row in r["watchlist"]}
+        for symbol,watch in retired.items():
+            row=dict(by_symbol.get(symbol) or {"ticker":symbol,"rank":"R"});row.update(watch_status=watch.get("watch_status","WATCHING"),watch_price=watch.get("watch_price"),exit_price=watch.get("exit_price"),reentry_watch=True);by_symbol[symbol]=row
+        r["watchlist"]=list(by_symbol.values())
+    except Exception:r["errors"].append("reentry_watchlist")
     r.update(trades_today=None,win_rate=None,trades=[],performance=[])
     try:
         from alpaca.trading.enums import QueryOrderStatus
