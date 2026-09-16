@@ -2,7 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py strategy.py ./
+COPY app.py strategy.py simulator.py ./
 COPY templates ./templates
 COPY static ./static
 RUN useradd --create-home --uid 10001 mosquito && mkdir -p /data && chown -R mosquito:mosquito /app /data

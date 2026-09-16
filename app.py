@@ -7,6 +7,7 @@ from functools import wraps
 from pathlib import Path
 from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
 from strategy import build_watchlist
+import simulator
 
 app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
 LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
@@ -236,6 +237,10 @@ def dashboard_data():
     except Exception:r["history"]=[];r["errors"].append("history")
     alerts_=[]
     if st["last_error"]:alerts_.append({"type":"error","message":st["last_error"]})
+    if truthy("MOSQUITO_ENABLE_SIMULATION"):
+        try:r["green_ribbon"]=cached("green_ribbon",60,simulator.value)
+        except Exception:r["green_ribbon"]={"status":"UNAVAILABLE","error":"Paper simulation prices are temporarily unavailable"};r["errors"].append("green_ribbon")
+    else:r["green_ribbon"]={"status":"DISABLED"}
     r["alerts"]=alerts_;r["alerts_count"]=len(alerts_)
     return jsonify(r)
 @app.post("/api/bot/start")
@@ -265,15 +270,22 @@ def start():
         except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
         return upstream(exc)
     already=bool(s["running"]);s.update(running=True,allocation=allocation,last_error=None)
+    simulation=None
+    if truthy("MOSQUITO_ENABLE_SIMULATION"):
+        try:simulation=simulator.start(allocation)
+        except Exception as exc:
+            s.update(running=False,last_error="V5.8 paper simulation could not start");save_state(s);app.logger.warning("simulation start failure: %s",type(exc).__name__);return error("V5.8 paper simulation could not start",503)
     try:save_state(s)
     except OSError as exc:
         app.logger.error("state persistence failure: %s",type(exc).__name__)
         return error("Bot state could not be saved",500)
-    return jsonify(ok=True,running=True,already_running=already,allocation=allocation,requested_allocation=req,capped=allocation<req,execution_enabled=enabled(),mode="paper" if paper() else "live",timestamp=now())
+    with LOCK:CACHE.clear()
+    return jsonify(ok=True,running=True,already_running=already,allocation=allocation,requested_allocation=req,capped=allocation<req,execution_enabled=enabled(),simulation_enabled=bool(simulation),mode="paper" if paper() else "live",timestamp=now())
 @app.post("/api/bot/stop")
 @rate_limit()
 def stop():
     s=load_state();already=not bool(s["running"]);s["running"]=False
+    if truthy("MOSQUITO_ENABLE_SIMULATION"):simulator.stop()
     try:save_state(s)
     except OSError as exc:
         app.logger.error("state persistence failure: %s",type(exc).__name__)
@@ -286,6 +298,9 @@ def exit_bot():
     body=request.get_json(silent=True)
     if not isinstance(body,dict) or body.get("confirm")!="EXIT ALL POSITIONS":
         return error('confirmation is required; send {"confirm":"EXIT ALL POSITIONS"}',400)
+    if truthy("MOSQUITO_ENABLE_SIMULATION") and not body.get("broker_exit"):
+        try:report=simulator.exit_all();s=load_state();s.update(running=False,exit_status="completed",last_error=None);save_state(s);CACHE.clear();return jsonify(ok=True,running=False,executed=True,submitted=False,completed=True,status="completed",message="Mosquito simulated positions were closed",green_ribbon=report,timestamp=now())
+        except Exception as exc:app.logger.warning("simulation exit failure: %s",type(exc).__name__);return error("Simulated positions could not be closed",503)
     request_id=str(body.get("request_id","")).strip()
     if len(request_id)>128:return error("request_id must be 128 characters or fewer")
     if request_id:

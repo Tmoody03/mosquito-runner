@@ -35,7 +35,8 @@ def build_watchlist(count=50):
         raise RuntimeError("Market data is temporarily unavailable")
     close, volume = data["Close"], data["Volume"]
     eligible = [t for t in close.columns if close[t].dropna().shape[0] >= 1008]
-    frame = _feature_frame(close[eligible].ffill(), volume[eligible].fillna(0))
+    clean_close=close[eligible].ffill();latest=clean_close.iloc[-1]
+    frame = _feature_frame(clean_close, volume[eligible].fillna(0))
     # Reconstructed, explicit V5.8 feature blend. No future holding-period data is used.
     frame["teddy_score"] = (0.10*_rank01(frame.momentum_1m)+0.15*_rank01(frame.momentum_3m)+
                             0.25*_rank01(frame.momentum_6m)+0.20*_rank01(frame.momentum_12m)+
@@ -45,7 +46,7 @@ def build_watchlist(count=50):
     positive_signal = float(frame.momentum_1m.median()) > 0
     april_gate = datetime.now(timezone.utc).month != 4 or positive_signal
     rows = [{"rank": i+1, "ticker": ticker, "score": round(float(row.teddy_score)*100, 2),
-             "weight_pct": round(100/len(picks), 2)} for i, (ticker, row) in enumerate(picks.iterrows())]
+             "weight_pct": round(100/len(picks), 6), "price": round(float(latest[ticker]), 6)} for i, (ticker, row) in enumerate(picks.iterrows())]
     return {"strategy": "V5.8 Master", "count": len(rows), "picks": rows,
             "positive_signal": positive_signal, "april_trade_allowed": april_gate,
             "generated_at": datetime.now(timezone.utc).isoformat(),

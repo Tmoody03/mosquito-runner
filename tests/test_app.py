@@ -206,3 +206,27 @@ def test_start_state_write_failure_is_sanitized(api, monkeypatch):
     assert r.status_code == 500
     assert r.json["error"] == "Bot state could not be saved"
     assert "SECRET" not in r.get_data(as_text=True)
+
+
+def test_green_ribbon_simulation_is_paper_only_and_persistent(tmp_path, monkeypatch):
+    import simulator
+    monkeypatch.setattr(simulator,"PATH",tmp_path/"simulation.json")
+    monkeypatch.setattr(simulator,"build_watchlist",lambda count:{"picks":[
+        {"ticker":"NVDA","price":100,"rank":1,"score":99}],"april_trade_allowed":True,
+        "generated_at":"2026-09-01T00:00:00+00:00"})
+    monkeypatch.setattr(simulator,"_closes",lambda symbols:__import__("pandas").DataFrame(
+        {"NVDA":[100,101,103]},index=__import__("pandas").date_range("2026-09-11",periods=3)))
+    data=simulator.start(50000)
+    assert data["positions"][0]["qty"]==500
+    report=simulator.value()
+    assert report["current_value"]==51500 and report["day_profit"]==1000
+    assert report["ribbon_value"]==1000 and report["ribbon_earned"] is True
+    assert simulator.load()["history"][-1]["value"]==51500
+
+
+def test_dashboard_exposes_green_ribbon_when_enabled(api,monkeypatch):
+    module,c,_=api
+    monkeypatch.setenv("MOSQUITO_ENABLE_SIMULATION","true")
+    monkeypatch.setattr(module.simulator,"value",lambda:{"status":"FINAL · MARKET CLOSED","current_value":51000,"eod_value":51000,"ribbon_value":1000,"ribbon_earned":True})
+    module.CACHE.clear();board=c.get("/api/dashboard").json
+    assert board["green_ribbon"]["current_value"]==51000
