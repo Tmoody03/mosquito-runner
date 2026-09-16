@@ -26,6 +26,8 @@ def _iso(value):
 class Lifecycle:
     """Persistent, idempotent V5.8 paper-entry and replacement coordinator."""
 
+    STRATEGY_REVISION = "green-ribbon-2026-09-16-v1"
+
     def __init__(self, broker, state_path, clock, *, portfolio_size=50,
                  rebuy_cooldown=timedelta(days=1)):
         self.broker = broker
@@ -53,7 +55,14 @@ class Lifecycle:
             raw = json.loads(self.path.read_text())
         except (OSError, ValueError, TypeError):
             raw = {}
+        # A strategy revision starts a new *local paper-test generation*.  This
+        # prevents symbols retired by an obsolete exit rule from blocking the
+        # corrected rule. Broker positions/orders remain authoritative and are
+        # never altered by this migration.
+        if raw and raw.get("strategy_revision") != self.STRATEGY_REVISION:
+            raw = {}
         return {
+            "strategy_revision": self.STRATEGY_REVISION,
             "orders": dict(raw.get("orders") or {}),
             "positions": dict(raw.get("positions") or {}),
             "retired": dict(raw.get("retired") or {}),
