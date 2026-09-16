@@ -22,6 +22,10 @@ EASTERN = ZoneInfo("America/New_York")
 DEFAULT_STATE_PATH = Path(os.getenv("MOSQUITO_SCHEDULER_FILE", "/data/mosquito-scheduler.json"))
 
 
+class RetryPending(RuntimeError):
+    """The session is healthy but an intraday condition is not satisfied yet."""
+
+
 def _aware(value: datetime, fallback_tz=EASTERN) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=fallback_tz)
@@ -173,6 +177,13 @@ class MarketScheduler:
             try:
                 result = self.orchestrate(session_date=session.key,
                                           idempotency_key=key, paper_only=True)
+            except RetryPending as exc:
+                state.update(status="waiting_entry_gate", checked_at=self.now().isoformat(),
+                             pending_reason=str(exc)[:160])
+                state.pop("error_type", None)
+                self.store.save(state)
+                return {"status": "waiting_entry_gate", "session_date": session.key,
+                        "idempotency_key": key}
             except Exception as exc:
                 state.update(status="failed", failed_at=self.now().isoformat(),
                              error_type=type(exc).__name__)
