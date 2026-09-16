@@ -49,13 +49,13 @@ def _timestamp(value):
 
 
 def cycle(broker, submit_enabled=False):
-    """Update peaks and submit idempotent protected paper limit sells."""
+    """Update peaks and submit idempotent paper market exits."""
     data=load(); old=data["positions"]; fresh={}; events=data["events"][-199:]
     try:current_positions=broker.get_all_positions()
     except Exception as exc:
         data["last_error"]={"code":"BROKER_DISCONNECTED","type":type(exc).__name__,"timestamp":_now()};save(data);raise
     from alpaca.trading.enums import OrderSide,TimeInForce
-    from alpaca.trading.requests import LimitOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest
     for p in current_positions:
         symbol=str(getattr(p,"symbol",""));qty=_num(getattr(p,"qty",None));entry=_num(getattr(p,"avg_entry_price",None));current=_num(getattr(p,"current_price",None));sample_at=_timestamp(getattr(p,"price_timestamp",None))
         if not symbol or not qty or qty<=0 or not entry or not current:continue
@@ -72,10 +72,11 @@ def cycle(broker, submit_enabled=False):
         guard=protected_state(entry,current,prior_peak)
         row={"symbol":symbol,"qty":qty,**guard,"price_timestamp":sample_at.isoformat() if sample_at else prior.get("price_timestamp"),"updated_at":_now(),"pending_order_id":prior.get("pending_order_id"),"sell_reason":prior.get("sell_reason")}
         if guard["should_sell"] and submit_enabled and not row["pending_order_id"]:
-            request=LimitOrderRequest(symbol=symbol,qty=qty,side=OrderSide.SELL,time_in_force=TimeInForce.DAY,limit_price=guard["protected_floor"],client_order_id=f"mosquito-trail-{symbol}-{int(entry*100)}-{int(time.time())}")
+            reason=guard["sell_reason"]
+            request=MarketOrderRequest(symbol=symbol,qty=qty,side=OrderSide.SELL,time_in_force=TimeInForce.DAY,client_order_id=f"mosquito-exit-{symbol}-{int(entry*100)}-{int(time.time())}")
             order=broker.submit_order(order_data=request)
-            row["pending_order_id"]=str(getattr(order,"id","submitted"));row["sell_reason"]="TRAIL_0.10_PERCENT_PROTECTED"
-            events.append({"type":"SELL_SUBMITTED","symbol":symbol,"qty":qty,"buy_price":entry,"trigger_price":guard["trailing_trigger"],"limit_price":guard["protected_floor"],"peak_price":guard["peak_price"],"order_id":row["pending_order_id"],"timestamp":_now()})
+            row["pending_order_id"]=str(getattr(order,"id","submitted"));row["sell_reason"]=reason
+            events.append({"type":"SELL_SUBMITTED","symbol":symbol,"qty":qty,"buy_price":entry,"observed_price":current,"trigger_price":guard["trailing_trigger"],"order_type":"market","reason":reason,"peak_price":guard["peak_price"],"order_id":row["pending_order_id"],"timestamp":_now()})
         fresh[symbol]=row
     closed=set(old)-set(fresh)
     for symbol in closed:
