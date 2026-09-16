@@ -155,7 +155,9 @@ def confirmed_entry_picks(picks):
     symbols=list(rows)
     for offset in range(0,len(symbols),20):
         batch=symbols[offset:offset+20]
-        snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
+        try:snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
+        except Exception as exc:
+            log_broker_error(exc,"entry_snapshot_batch","/v2/stocks/snapshots");continue
         for symbol in batch:
             snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None)
             opened=number(getattr(bar,"open",None));current=number(getattr(trade,"price",None));stamp=getattr(trade,"timestamp",None)
