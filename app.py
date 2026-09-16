@@ -123,7 +123,7 @@ def reconcile_closed_positions(broker,life):
     if changed:
         engine.save(data)
         try:
-            picks=tradable_picks(broker,60);prices={p["ticker"]:p["price"] for p in picks};bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
+            picks=confirmed_entry_picks(tradable_picks(broker,60));prices={p["ticker"]:p["price"] for p in picks};bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
             life.rebalance(picks,prices,bp,dead_symbols=())
         except Exception as exc:log_broker_error(exc,"replacement_cycle")
     return closed
@@ -137,6 +137,33 @@ def tradable_picks(broker,count=50):
     if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
     return picks
+def entry_signal_met(session_open,current_price,threshold=0.005):
+    """Return true only after a stock gains the required amount from today's open."""
+    opened=number(session_open);current=number(current_price);threshold=number(threshold)
+    return bool(opened and opened>0 and current and current>0 and threshold is not None and threshold>=0 and current>=opened*(1+threshold))
+def confirmed_entry_picks(picks):
+    """Fail-closed live Alpaca gate for new buys; stale/missing snapshots never qualify."""
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockSnapshotRequest
+    key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
+    market=StockHistoricalDataClient(key,secret);threshold=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"))
+    if threshold is None:threshold=0.005
+    if threshold<0 or threshold>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
+    rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
+    symbols=list(rows)
+    for offset in range(0,len(symbols),60):
+        batch=symbols[offset:offset+60]
+        snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
+        for symbol in batch:
+            snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None)
+            opened=number(getattr(bar,"open",None));current=number(getattr(trade,"price",None));stamp=getattr(trade,"timestamp",None)
+            if stamp is None:continue
+            if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
+            if utc_now-stamp.astimezone(timezone.utc)>timedelta(minutes=2):continue
+            if not entry_signal_met(opened,current,threshold):continue
+            row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True);qualified.append(row)
+    return sorted(qualified,key=lambda row:(row.get("rank",10**9),-float(row.get("score",0))))
 def alpaca_history(symbols):
     import pandas as pd
     from alpaca.data.enums import DataFeed
@@ -161,12 +188,13 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if not enabled():return {"session_date":session_date,"status":"broker_execution_disabled","orders":0,"paper_only":True}
     broker=client();account=account_data();bp=number(account.get("buying_power")) or 0;requested=number(state.get("requested_investment")) or min(50000,bp);allocation=min(requested,bp)
     if allocation<=0:raise RuntimeError("No paper buying power is available")
-    picks=tradable_picks(broker,100);life=lifecycle_for(broker);current=life.reconcile()
+    picks=tradable_picks(broker,100);confirmed=confirmed_entry_picks(picks);life=lifecycle_for(broker);current=life.reconcile()
     if not current.get("positions") and not current.get("orders"):
-        result=life.enter(picks,allocation)
+        if len(confirmed)<50:raise RuntimeError(f"Entry gate waiting: {len(confirmed)}/50 candidates are at least 0.50% above the session open")
+        result=life.enter(confirmed,allocation)
     else:
         selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
-        result=life.rebalance(picks,prices,bp,dead_symbols=dead)
+        result=life.rebalance(confirmed,prices,bp,dead_symbols=dead)
     state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
     return {"session_date":session_date,"idempotency_key":idempotency_key,"selected":50,"eligible_candidates":len(picks),"orders":len(result.get("orders",{})),"allocation":allocation,"paper_only":True}
 def broker_calendar(*,start,end):

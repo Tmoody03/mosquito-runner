@@ -21,6 +21,7 @@ def test_open_orchestration_glues_selection_to_paper_lifecycle(api, monkeypatch)
     monkeypatch.setattr(module,"account_data",lambda:{"buying_power":"60000"})
     picks=[{"ticker":f"AI{i:03}","rank":i,"score":100-i,"price":10+i,"eligible":True} for i in range(1,101)]
     monkeypatch.setattr(module,"tradable_picks",lambda _broker,count=100:picks[:count])
+    monkeypatch.setattr(module,"confirmed_entry_picks",lambda selected:selected)
     calls=[]
     class Life:
         def reconcile(self):return {"positions":{},"orders":{}}
