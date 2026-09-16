@@ -127,6 +127,26 @@ def reconcile_closed_positions(broker,life):
             picks=confirmed_entry_picks(tradable_picks(broker,60));prices={p["ticker"]:p["price"] for p in picks};bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
             life.rebalance(picks,prices,bp,dead_symbols=())
         except Exception as exc:log_broker_error(exc,"replacement_cycle")
+    # Recover a close even if the process restarted between sell submission and
+    # the engine's disappearance event. Never infer a price: only a broker-
+    # reported filled SELL may retire a local filled lot.
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        local=life.reconcile();actual={str(getattr(p,"symbol","")).upper() for p in broker.get_all_positions()}
+        missing={s:lot for s,lot in local.get("positions",{}).items() if s not in actual}
+        if missing:
+            closed_orders=broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED,limit=500,nested=False))
+            for symbol,lot in missing.items():
+                candidates=[]
+                for order in closed_orders:
+                    side=str(getattr(getattr(order,"side",None),"value",getattr(order,"side",""))).lower()
+                    status=str(getattr(getattr(order,"status",None),"value",getattr(order,"status",""))).lower()
+                    price=number(getattr(order,"filled_avg_price",None));filled_at=getattr(order,"filled_at",None)
+                    if str(getattr(order,"symbol","")).upper()==symbol and side=="sell" and status=="filled" and price and filled_at:candidates.append((filled_at,price))
+                if candidates:
+                    filled_at,price=max(candidates,key=lambda item:item[0]);life.record_exit(symbol,fill_price=price,filled_at=filled_at);closed.append(symbol)
+    except Exception as exc:log_broker_error(exc,"closed_order_reconciliation")
     return closed
 def tradable_picks(broker,count=50):
     from alpaca.trading.enums import AssetClass,AssetStatus
