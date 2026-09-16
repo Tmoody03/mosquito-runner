@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 260" role="img" aria-labelledby="title desc">
+  <title id="title">Mosquito trading bot</title>
+  <desc id="desc">A neon green and black mosquito with dollar sign wings</desc>
+  <defs>
+    <linearGradient id="wing" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#edff72"/><stop offset="1" stop-color="#67e600"/></linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#56616b"/><stop offset=".5" stop-color="#080b0c"/><stop offset="1" stop-color="#1b2227"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <g filter="url(#glow)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M148 106C105 16 32 10 18 36c-18 34 70 77 126 92" fill="url(#wing)" stroke="#a3ff29" stroke-width="7"/>
+    <path d="M208 105c45-88 118-90 133-64 17 32-68 72-129 88" fill="url(#wing)" stroke="#a3ff29" stroke-width="7"/>
+    <text x="65" y="77" fill="#fff" stroke="#3c7f00" stroke-width="2" font-family="Arial Black,sans-serif" font-size="45">$</text>
+    <text x="257" y="78" fill="#fff" stroke="#3c7f00" stroke-width="2" font-family="Arial Black,sans-serif" font-size="45">$</text>
+    <path d="M137 129 73 115M220 129l68-17M145 153 72 192M214 154l72 42M152 174l-45 68M204 174l46 67" fill="none" stroke="#151b1e" stroke-width="12"/>
+    <ellipse cx="178" cy="157" rx="48" ry="66" fill="url(#body)" stroke="#a3ff29" stroke-width="5"/>
+    <circle cx="178" cy="104" r="38" fill="url(#body)" stroke="#9aa1a5" stroke-width="5"/>
+    <path d="m166 90-22-10 18 24m28-14 22-10-18 24" fill="#ff1717" stroke="#ff4a22" stroke-width="5"/>
+    <path d="M154 116q24 28 49-1-5 35-47 22" fill="#fff" stroke="#090b0c" stroke-width="5"/>
+    <path d="m198 124 94 104-118-89" fill="#32383d" stroke="#c7ced1" stroke-width="4"/>
+    <path d="M157 72 133 34m67 38 24-38" fill="none" stroke="#1c2226" stroke-width="8"/>
+  </g>
+</svg>
