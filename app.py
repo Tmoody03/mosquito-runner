@@ -1,721 +1,1 @@
-"""Production API for Mosquito Runner; paper-safe by default."""
-from __future__ import annotations
-import concurrent.futures,hmac,json,math,os,re,tempfile,threading,time
-from collections import defaultdict,deque
-from datetime import date,datetime,timedelta,timezone
-from functools import wraps
-from pathlib import Path
-from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
-from strategy import AI_UNIVERSE,build_watchlist,rank_watchlist
-import simulator
-import engine
-from protection import protected_state
-from lifecycle import Lifecycle
-from scheduler import MarketScheduler,RetryPending
-
-app=Flask(__name__,static_folder=None); app.config["MAX_CONTENT_LENGTH"]=65536
-LOCK=threading.RLock(); EXIT_LOCK=threading.Lock(); CACHE={}; CALLS=defaultdict(deque); EXIT_RESULTS={}
-ENGINE_THREAD=None;ENGINE_THREAD_LOCK=threading.Lock();SCHEDULER_THREAD=None;SCHEDULER_THREAD_LOCK=threading.Lock();RUNTIME_STOP=threading.Event()
-RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
-BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
-BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
-STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
-DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selected_watchlist":[],"last_qualified_count":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
-def now(): return datetime.now(timezone.utc).isoformat()
-def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
-def paper(): return True
-def enabled(): return truthy("ALPACA_ENABLE_ORDER_EXECUTION")
-def _safe_log_text(value):
-    text=str(value or "")[:300].replace("\r"," ").replace("\n"," ")
-    for name in ("ALPACA_API_KEY","ALPACA_API_KEY_ID","APCA_API_KEY_ID","ALPACA_SECRET_KEY","ALPACA_API_SECRET_KEY","APCA_API_SECRET_KEY"):
-        secret=os.getenv(name)
-        if secret:text=text.replace(secret,"[REDACTED]")
-    text=re.sub(r"(?i)(authorization|api[-_ ]?key|secret|token)(\s*[:=]\s*)([^,; ]+)",r"\1\2[REDACTED]",text)
-    return text
-def log_broker_error(exc,operation,endpoint=None):
-    fields={"error_class":type(exc).__name__,"operation":operation}
-    if endpoint:fields["endpoint"]=endpoint
-    try:
-        from alpaca.common.exceptions import APIError
-        if isinstance(exc,APIError):
-            for name in ("status_code","code","message"):
-                try:value=getattr(exc,name,None)
-                except Exception:value=None
-                if value not in (None,""):fields[name]=_safe_log_text(value)
-    except ImportError:pass
-    app.logger.warning("broker failure %s",json.dumps(fields,separators=(",",":"),sort_keys=True))
-def engine_loop():
-    while True:
-        try:
-            if load_state().get("running"):
-                broker=client();life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life)
-        except Exception as exc:log_broker_error(exc,"trailing_engine_cycle")
-        if RUNTIME_STOP.wait(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5)):break
-def ensure_engine():
-    global ENGINE_THREAD
-    with ENGINE_THREAD_LOCK:
-        if ENGINE_THREAD is None or not ENGINE_THREAD.is_alive():
-            ENGINE_THREAD=threading.Thread(target=engine_loop,name="mosquito-trailing-engine",daemon=True);ENGINE_THREAD.start()
-def credentials():
-    return (os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID"),os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY"))
-def client():
-    key,secret=credentials()
-    if not key or not secret: raise RuntimeError("missing credentials")
-    from alpaca.trading.client import TradingClient
-    return TradingClient(key,secret,paper=paper())
-def _broker_health_probe():
-    broker=client();broker.get_account();broker.get_clock()
-    return True
-def broker_health_data():
-    global BROKER_HEALTH_FUTURE,BROKER_HEALTH_CACHE,BROKER_HEALTH_EXPIRES
-    checked_at=now();key,secret=credentials()
-    if not key or not secret:return {"status":"degraded","configured":False,"authenticated":False,"account_readable":False,"clock_readable":False,"paper_mode":paper(),"checked_at":checked_at}
-    with BROKER_HEALTH_LOCK:
-        if BROKER_HEALTH_CACHE is not None and BROKER_HEALTH_EXPIRES>time.monotonic():return dict(BROKER_HEALTH_CACHE)
-        if BROKER_HEALTH_FUTURE is None or BROKER_HEALTH_FUTURE.done():BROKER_HEALTH_FUTURE=BROKER_HEALTH_POOL.submit(_broker_health_probe)
-        future=BROKER_HEALTH_FUTURE
-    timeout=max(.25,min(5.0,number(os.getenv("MOSQUITO_BROKER_HEALTH_TIMEOUT")) or 2.0))
-    try:
-        future.result(timeout=timeout)
-        result={"status":"ok","configured":True,"authenticated":True,"account_readable":True,"clock_readable":True,"paper_mode":paper(),"checked_at":checked_at}
-        ttl=30.0
-    except concurrent.futures.TimeoutError:
-        result={"status":"degraded","configured":True,"authenticated":False,"account_readable":False,"clock_readable":False,"paper_mode":paper(),"checked_at":checked_at}
-        ttl=5.0
-    except Exception as exc:
-        log_broker_error(exc,"broker_health_probe","/v2/account,/v2/clock")
-        result={"status":"degraded","configured":True,"authenticated":False,"account_readable":False,"clock_readable":False,"paper_mode":paper(),"checked_at":checked_at}
-        ttl=30.0
-    with BROKER_HEALTH_LOCK:
-        BROKER_HEALTH_CACHE=dict(result);BROKER_HEALTH_EXPIRES=time.monotonic()+ttl
-        if future.done():BROKER_HEALTH_FUTURE=None
-    return result
-class PaperBrokerAdapter:
-    paper=True
-    def __init__(self,broker):self.broker=broker
-    def submit_order(self,request):
-        if not enabled():raise RuntimeError("broker order execution is disabled")
-        from alpaca.trading.enums import OrderSide,OrderType,TimeInForce
-        from alpaca.trading.requests import MarketOrderRequest
-        if str(request.get("side")).lower()!="buy":raise RuntimeError("paper lifecycle accepts buy orders only")
-        order=MarketOrderRequest(symbol=request["symbol"],notional=float(request["notional"]),side=OrderSide.BUY,type=OrderType.MARKET,time_in_force=TimeInForce.DAY,client_order_id=request["client_order_id"])
-        return self.broker.submit_order(order_data=order)
-    def get_order_by_client_id(self,client_id):
-        try:return self.broker.get_order_by_client_id(client_id)
-        except Exception:return None
-class BrokerClock:
-    def __init__(self,broker):self.broker=broker
-    def now(self):return getattr(self.broker.get_clock(),"timestamp",None) or datetime.now(timezone.utc)
-    def is_market_open(self):return bool(getattr(self.broker.get_clock(),"is_open",False))
-def lifecycle_for(broker):
-    minutes=max(0,number(os.getenv("MOSQUITO_REBUY_COOLDOWN_MINUTES")) or 5)
-    return Lifecycle(PaperBrokerAdapter(broker),os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json"),BrokerClock(broker),portfolio_size=50,rebuy_cooldown=timedelta(minutes=minutes))
-def reconcile_closed_positions(broker,life):
-    data=engine.load();changed=False;closed=[]
-    for event in data.get("events",[]):
-        if event.get("type")!="POSITION_CLOSED_PENDING_RECONCILIATION" or event.get("reconciled"):continue
-        order_id=event.get("order_id")
-        if not order_id:continue
-        try:order=broker.get_order_by_id(order_id)
-        except Exception:continue
-        status=str(getattr(order,"status","")).lower();price=number(getattr(order,"filled_avg_price",None));qty=number(getattr(order,"filled_qty",None))
-        if status=="filled" and price and qty:
-            life.record_exit(event["symbol"],fill_price=price,filled_at=getattr(order,"filled_at",None));event.update(reconciled=True,sell_price=price,filled_qty=qty,reconciled_at=now());closed.append(event["symbol"]);changed=True
-    if changed:
-        engine.save(data)
-        try:
-            picks=confirmed_entry_picks(tradable_picks(broker,60));prices={p["ticker"]:p["price"] for p in picks};bp=number(getattr(broker.get_account(),"buying_power",0)) or 0
-            life.rebalance(picks,prices,bp,dead_symbols=())
-        except Exception as exc:log_broker_error(exc,"replacement_cycle")
-    # Recover a close even if the process restarted between sell submission and
-    # the engine's disappearance event. Never infer a price: only a broker-
-    # reported filled SELL may retire a local filled lot.
-    try:
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-        local=life.reconcile();actual={str(getattr(p,"symbol","")).upper() for p in broker.get_all_positions()}
-        missing={s:lot for s,lot in local.get("positions",{}).items() if s not in actual}
-        if missing:
-            closed_orders=broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED,limit=500,nested=False))
-            for symbol,lot in missing.items():
-                candidates=[]
-                for order in closed_orders:
-                    side=str(getattr(getattr(order,"side",None),"value",getattr(order,"side",""))).lower()
-                    status=str(getattr(getattr(order,"status",None),"value",getattr(order,"status",""))).lower()
-                    price=number(getattr(order,"filled_avg_price",None));filled_at=getattr(order,"filled_at",None)
-                    if str(getattr(order,"symbol","")).upper()==symbol and side=="sell" and status=="filled" and price and filled_at:candidates.append((filled_at,price))
-                if candidates:
-                    filled_at,price=max(candidates,key=lambda item:item[0]);life.record_exit(symbol,fill_price=price,filled_at=filled_at);closed.append(symbol)
-    except Exception as exc:log_broker_error(exc,"closed_order_reconciliation")
-    return closed
-def tradable_picks(broker,count=50):
-    from alpaca.trading.enums import AssetClass,AssetStatus
-    from alpaca.trading.requests import GetAssetsRequest
-    assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
-    tradable={str(getattr(a,"symbol","")).upper() for a in assets if bool(getattr(a,"tradable",False)) and bool(getattr(a,"fractionable",False))}
-    candidates=[symbol for symbol in AI_UNIVERSE if symbol in tradable];close,volume=alpaca_history(candidates);watch=rank_watchlist(close,volume,min(250,200+count),source="alpaca_daily_bars")
-    picks=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
-    if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
-    for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
-    return picks
-
-def qualifying_universe_picks(broker, limit=50, ranked=None):
-    """Rank the eligible AI universe, then apply today's live entry gate.
-
-    The entry gate must not be applied only to the first 50 ranked names: during a
-    mid-session launch that can leave the portfolio empty even though lower-ranked
-    AI names have already moved through the configured threshold.  Rank up to 250
-    eligible names first, gate that full pool using today's Alpaca open/latest
-    trade, and retain the best qualifying names in deterministic rank order.
-    """
-    ranked = ranked or tradable_picks(broker, 50)
-    return confirmed_entry_picks(ranked)[:max(1, min(int(limit), 50))]
-def entry_signal_met(session_open,current_price,threshold=0.001):
-    """Return true only after a stock gains the required amount from today's open."""
-    opened=number(session_open);current=number(current_price);threshold=number(threshold)
-    return bool(opened and opened>0 and current and current>0 and threshold is not None and threshold>=0 and current>=opened*(1+threshold))
-def confirmed_entry_picks(picks):
-    """Fail-closed live Alpaca gate for new buys; stale/missing snapshots never qualify."""
-    from alpaca.data.enums import DataFeed
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockSnapshotRequest
-    key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
-    market=StockHistoricalDataClient(key,secret);threshold=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"))
-    if threshold is None:threshold=0.001
-    if threshold<0 or threshold>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
-    rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
-    symbols=list(rows)
-    def snapshots_for(batch):
-        """Isolate a bad/unavailable symbol instead of blocking the other 49."""
-        try:
-            return market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch,feed=feed)) or {}
-        except Exception as exc:
-            log_broker_error(exc,"entry_snapshot",f"symbols={len(batch)}")
-            if len(batch)<=1:return {}
-            middle=len(batch)//2
-            return {**snapshots_for(batch[:middle]),**snapshots_for(batch[middle:])}
-    batches=[symbols[offset:offset+20] for offset in range(0,len(symbols),20)]
-    # A full-universe midday scan must finish before the signal changes. Fetch
-    # independent Alpaca snapshot batches concurrently instead of serially
-    # waiting through every symbol group.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6,max(1,len(batches)))) as pool:
-        batch_results=list(zip(batches,pool.map(snapshots_for,batches)))
-    for batch,snapshots in batch_results:
-        for symbol in batch:
-            snap=snapshots.get(symbol);bar=getattr(snap,"daily_bar",None);trade=getattr(snap,"latest_trade",None);quote=getattr(snap,"latest_quote",None);minute=getattr(snap,"minute_bar",None)
-            opened=number(getattr(bar,"open",None))
-            # The executable ask is the conservative live buy observation. IEX's
-            # last trade can be old even while its quote is current, which made a
-            # healthy midday scan falsely report zero qualifiers.
-            ask=number(getattr(quote,"ask_price",None));bid=number(getattr(quote,"bid_price",None))
-            current=ask or (number(getattr(trade,"price",None))) or number(getattr(minute,"close",None))
-            stamp=(getattr(quote,"timestamp",None) if ask else None) or getattr(trade,"timestamp",None) or getattr(minute,"timestamp",None)
-            if stamp is None:continue
-            if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
-            if utc_now-stamp.astimezone(timezone.utc)>timedelta(minutes=5):continue
-            if not entry_signal_met(opened,current,threshold):continue
-            row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True,entry_price_source=("ask" if ask else "last_trade"));qualified.append(row)
-    return sorted(qualified,key=lambda row:(row.get("rank",10**9),-float(row.get("score",0))))
-def alpaca_history(symbols):
-    import pandas as pd
-    from alpaca.data.enums import DataFeed
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-    key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
-    market=StockHistoricalDataClient(key,secret);closes=[];volumes=[];start=datetime.now(timezone.utc)-timedelta(days=5*366)
-    for offset in range(0,len(symbols),20):
-        batch=symbols[offset:offset+20];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
-        if frame is None or frame.empty:continue
-        if isinstance(frame.index,pd.MultiIndex):
-            closes.append(frame["close"].unstack(level="symbol"));volumes.append(frame["volume"].unstack(level="symbol"))
-    if not closes:raise RuntimeError("Alpaca market history is unavailable")
-    close=pd.concat(closes,axis=1).sort_index();volume=pd.concat(volumes,axis=1).reindex(close.index)
-    close.columns=[str(c).upper() for c in close.columns];volume.columns=[str(c).upper() for c in volume.columns]
-    return close.loc[:,~close.columns.duplicated()],volume.loc[:,~volume.columns.duplicated()]
-def orchestrate_open(*,session_date,idempotency_key,paper_only):
-    if not paper_only or not paper():raise RuntimeError("paper-only launch required")
-    state=load_state()
-    if not state.get("armed",True):return {"session_date":session_date,"status":"disarmed","paper_only":True}
-    if not enabled():return {"session_date":session_date,"status":"broker_execution_disabled","orders":0,"paper_only":True}
-    broker=client();account=account_data();bp=number(account.get("buying_power")) or 0;requested=number(state.get("requested_investment")) or min(50000,bp);allocation=min(requested,bp)
-    if allocation<=0:raise RuntimeError("No paper buying power is available")
-    life=lifecycle_for(broker);current=life.reconcile()
-    pending_statuses={"new","accepted","pending_new","partially_filled","submitted"}
-    occupied=set(current.get("positions",{}))|{o.get("symbol") for o in current.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
-    locked=list(state.get("selected_watchlist") or [])
-    candidate_pool=list(state.get("selection_universe") or [])
-    if not candidate_pool:
-        # Migrate the pre-full-universe state safely. With no broker exposure,
-        # discard the old pre-gated 50 so qualified lower-ranked names can enter.
-        if not occupied:locked=[]
-        candidate_pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible")} for row in tradable_picks(broker,50)]
-    live_qualified=qualifying_universe_picks(broker,50,ranked=candidate_pool)
-    # Preserve already selected/ordered symbols and append newly qualified names
-    # in V5.8 rank order until the equal-weight Top 50 is full.
-    by_symbol={str(row.get("ticker")):dict(row) for row in locked}
-    for row in live_qualified:
-        symbol=str(row.get("ticker"))
-        if symbol and (symbol in by_symbol or len(by_symbol)<50):by_symbol[symbol]=dict(row)
-    locked=sorted(by_symbol.values(),key=lambda row:row.get("rank",10**9))[:50]
-    qualified_symbols={str(row.get("ticker")) for row in live_qualified}
-    confirmed=[row for row in locked if str(row.get("ticker")) in qualified_symbols and str(row.get("ticker")) not in occupied]
-    state.update(selection_universe=candidate_pool,selected_watchlist=locked,last_qualified_count=len(live_qualified),last_scan=now(),last_error=None);save_state(state)
-    picks=locked
-    if len(occupied)<50:
-        result=life.enter_available(confirmed,bp,total_budget=allocation)
-        occupied=set(result.get("positions",{}))|{o.get("symbol") for o in result.get("orders",{}).values() if str(o.get("status","")).lower() in pending_statuses}
-        state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
-        if len(occupied)<50:raise RetryPending(f"Full-universe entry scan: {len(locked)} qualified; {len(occupied)}/50 have paper positions or pending orders")
-    else:
-        selected={p["ticker"] for p in picks[:50]};dead=set(current.get("positions",{}))-selected;prices={p["ticker"]:p["price"] for p in picks}
-        result=life.rebalance(confirmed,prices,bp,dead_symbols=dead)
-    state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
-    return {"session_date":session_date,"idempotency_key":idempotency_key,"selected":50,"eligible_candidates":len(picks),"orders":len(result.get("orders",{})),"allocation":allocation,"paper_only":True}
-def broker_calendar(*,start,end):
-    from alpaca.trading.requests import GetCalendarRequest
-    return client().get_calendar(GetCalendarRequest(start=date.fromisoformat(start),end=date.fromisoformat(end)))
-def scheduler_instance():return MarketScheduler(lambda:client().get_clock(),broker_calendar,orchestrate_open,state_path=os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"),paper_only=True)
-def ensure_scheduler():
-    global SCHEDULER_THREAD
-    with SCHEDULER_THREAD_LOCK:
-        if SCHEDULER_THREAD is None or not SCHEDULER_THREAD.is_alive():
-            scheduler=scheduler_instance();SCHEDULER_THREAD=threading.Thread(target=scheduler.run_forever,args=(RUNTIME_STOP,),kwargs={"poll_seconds":15},name="mosquito-market-scheduler",daemon=True);SCHEDULER_THREAD.start()
-def reset_paths():
-    return [STATE_PATH,engine.PATH,Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")),Path(os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json")),Path(os.getenv("MOSQUITO_SIM_FILE","/data/mosquito-simulation.json"))]
-def reset_marker():return Path(os.getenv("MOSQUITO_RESET_MARKER","/data/mosquito-reset-marker.json"))
-def reset_status():
-    try:return json.loads(Path(os.getenv("MOSQUITO_RESET_STATUS","/data/mosquito-reset-status.json")).read_text())
-    except (OSError,ValueError):return {"status":"not_requested"}
-def write_reset_status(value):
-    path=Path(os.getenv("MOSQUITO_RESET_STATUS","/data/mosquito-reset-status.json"));path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(value,separators=(",",":")))
-def reset_done(reset_id):
-    try:return json.loads(reset_marker().read_text()).get("reset_id")==reset_id
-    except (OSError,ValueError):return False
-def run_paper_reset(reset_id):
-    try:
-        if not paper():raise RuntimeError("paper-only reset required")
-        write_reset_status({"status":"closing_old_paper_session","reset_id":reset_id,"started_at":now()})
-        broker=client();broker.close_all_positions(cancel_orders=True)
-        deadline=time.monotonic()+120
-        while time.monotonic()<deadline:
-            if not broker.get_all_positions():break
-            time.sleep(2)
-        remaining=broker.get_all_positions()
-        if remaining:raise RuntimeError(f"paper positions still open: {len(remaining)}")
-        for path in reset_paths():
-            try:path.unlink()
-            except FileNotFoundError:pass
-        account=broker.get_account();baseline=number(getattr(account,"equity",None))
-        state={**DEFAULTS,"allocation":50000.0,"requested_investment":50000.0,"baseline_equity":baseline,"running":True,"armed":True,"last_error":None};save_state(state)
-        marker=reset_marker();marker.parent.mkdir(parents=True,exist_ok=True);marker.write_text(json.dumps({"reset_id":reset_id,"completed_at":now()},separators=(",",":")))
-        write_reset_status({"status":"complete","reset_id":reset_id,"allocation":50000.0,"old_positions_remaining":0,"completed_at":now()})
-        with LOCK:CACHE.clear()
-        ensure_engine();ensure_scheduler()
-    except Exception as exc:
-        write_reset_status({"status":"failed","reset_id":reset_id,"error_type":type(exc).__name__,"failed_at":now()})
-        app.logger.error("paper reset failed: %s",type(exc).__name__)
-def ensure_reset():
-    global RESET_THREAD
-    reset_id=str(os.getenv("MOSQUITO_RESET_ID","")).strip()
-    if not reset_id or reset_done(reset_id):return True
-    with RESET_THREAD_LOCK:
-        if RESET_THREAD is None or not RESET_THREAD.is_alive():
-            RESET_THREAD=threading.Thread(target=run_paper_reset,args=(reset_id,),name="mosquito-paper-reset",daemon=True);RESET_THREAD.start()
-    return False
-def ensure_runtime():
-    if truthy("MOSQUITO_RUNTIME_ENABLED") or bool(os.getenv("RAILWAY_ENVIRONMENT")):
-        if ensure_reset():ensure_engine();ensure_scheduler()
-def serial(v):
-    if v is None or isinstance(v,(str,bool,int,float)): return v
-    if isinstance(v,datetime): return v.isoformat()
-    if isinstance(v,(list,tuple)): return [serial(x) for x in v]
-    if isinstance(v,dict): return {str(k):serial(x) for k,x in v.items()}
-    if hasattr(v,"model_dump"): return serial(v.model_dump(mode="json"))
-    if hasattr(v,"dict"): return serial(v.dict())
-    return str(v)
-def number(v):
-    try: n=float(v); return n if math.isfinite(n) else None
-    except (TypeError,ValueError): return None
-def load_state():
-    with LOCK:
-        try:
-            raw=json.loads(STATE_PATH.read_text())
-            if not isinstance(raw,dict): raw={}
-        except (OSError,ValueError): raw={}
-        state={**DEFAULTS,**{k:raw[k] for k in DEFAULTS if k in raw}}
-        # States written before requested_investment existed used allocation for
-        # both the owner's request and the buying-power-capped allocation.
-        if "requested_investment" not in raw:state["requested_investment"]=state["allocation"]
-        return state
-def save_state(state):
-    state={**DEFAULTS,**{k:state[k] for k in DEFAULTS if k in state},"updated_at":now()}
-    with LOCK:
-        STATE_PATH.parent.mkdir(parents=True,exist_ok=True)
-        fd,name=tempfile.mkstemp(prefix=".mosquito-",dir=str(STATE_PATH.parent))
-        try:
-            with os.fdopen(fd,"w") as f: json.dump(state,f,separators=(",",":"))
-            os.replace(name,STATE_PATH)
-        finally:
-            try: os.unlink(name)
-            except FileNotFoundError: pass
-def cached(key,ttl,loader):
-    t=time.monotonic()
-    with LOCK:
-        hit=CACHE.get(key)
-        if hit and hit[0]>t:return hit[1]
-    value=loader()
-    with LOCK:CACHE[key]=(t+ttl,value)
-    return value
-def error(message,status=400): return jsonify(error=message,timestamp=now()),status
-def upstream(exc,operation="broker_request",endpoint=None):log_broker_error(exc,operation,endpoint);return error("Broker service is temporarily unavailable",503)
-def authorized():
-    expected=os.getenv("DASHBOARD_TOKEN")
-    if not expected:return True
-    auth=request.headers.get("Authorization",""); supplied=auth[7:].strip() if auth.lower().startswith("bearer ") else None
-    supplied=supplied or request.headers.get("X-Dashboard-Token") or request.args.get("token") or request.cookies.get("mosquito_access")
-    return bool(supplied) and hmac.compare_digest(supplied,expected)
-@app.before_request
-def protect():
-    ensure_runtime()
-    if request.path.startswith("/api/") and not authorized():return error("Unauthorized",401)
-@app.after_request
-def headers(response):
-    for k,v in {"X-Content-Type-Options":"nosniff","X-Frame-Options":"DENY","Referrer-Policy":"no-referrer","Permissions-Policy":"camera=(), microphone=(), geolocation=()","Content-Security-Policy":"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'"}.items():response.headers[k]=v
-    if request.path.startswith("/api/"):response.headers["Cache-Control"]="no-store"
-    token=request.args.get("token");expected=os.getenv("DASHBOARD_TOKEN")
-    if token and expected and hmac.compare_digest(token,expected):response.set_cookie("mosquito_access",token,httponly=True,secure=request.is_secure,samesite="Strict",max_age=2592000)
-    return response
-def rate_limit(limit=20,window=60):
-    def deco(fn):
-        @wraps(fn)
-        def wrap(*a,**kw):
-            ident=f"{request.remote_addr}:{request.path}";t=time.monotonic()
-            with LOCK:
-                q=CALLS[ident]
-                while q and q[0]<=t-window:q.popleft()
-                if len(q)>=limit:return error("Too many requests; try again shortly",429)
-                q.append(t)
-            return fn(*a,**kw)
-        return wrap
-    return deco
-@app.get("/")
-def root():
-    if os.getenv("DASHBOARD_TOKEN") and not authorized(): return redirect("/login")
-    return make_response(send_from_directory(Path(app.root_path)/"templates","index.html"))
-@app.route("/login",methods=["GET","POST"])
-def login():
-    if not os.getenv("DASHBOARD_TOKEN"): return redirect("/")
-    if request.method=="POST":
-        token=request.form.get("token","")
-        if hmac.compare_digest(token,os.getenv("DASHBOARD_TOKEN","")):
-            response=make_response(redirect("/"));response.set_cookie("mosquito_access",token,httponly=True,secure=request.is_secure,samesite="Strict",max_age=2592000);return response
-    return """<!doctype html><meta name=viewport content='width=device-width'><title>Mosquito Login</title><style>body{background:#050705;color:#fff;font:18px system-ui;display:grid;place-items:center;height:100vh;margin:0}form{width:min(85vw,380px);padding:30px;border:1px solid #35452a;border-radius:18px;background:#0c100b}input,button{box-sizing:border-box;width:100%;padding:15px;margin-top:15px;border-radius:10px}button{background:#76ed0b;font-weight:800}</style><form method=post><h1>MOSQUITO</h1><label>Owner access token<input name=token type=password required autofocus></label><button>OPEN DASHBOARD</button></form>""",(401 if request.method=="POST" else 200)
-@app.get("/<path:name>")
-def assets(name):
-    if not name.startswith("static/"):return error("Not found",404)
-    asset=name.removeprefix("static/")
-    if asset not in {"style.css","app.js","mosquito-hero.webp","mosquito-hero-profit.webp"}:return error("Not found",404)
-    return send_from_directory(Path(app.root_path)/"static",asset)
-@app.get("/health")
-def health():return jsonify(status="ok",service="mosquito-runner",timestamp=now())
-@app.get("/ready")
-def ready():
-    k,s=credentials();return jsonify(status="ready",alpaca_configured=bool(k and s),state_writable=os.access(STATE_PATH.parent,os.W_OK),timestamp=now())
-@app.get("/broker-health")
-def broker_health():
-    result=broker_health_data();return jsonify(result),(200 if result["status"]=="ok" else 503)
-@app.get("/reset-health")
-def reset_health():return jsonify(reset_status())
-@app.get("/session-health")
-def session_health():
-    """Public, non-sensitive launch proof: counts and states only."""
-    scheduler_path=Path(os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"))
-    try:scheduler=json.loads(scheduler_path.read_text())
-    except (OSError,ValueError):scheduler={}
-    result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason"),"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
-    try:
-        lifecycle=json.loads(Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")).read_text())
-        payload["lifecycle_orders"]=len(lifecycle.get("orders") or {})
-        payload["lifecycle_positions"]=len(lifecycle.get("positions") or {})
-        payload["retired_positions"]=len(lifecycle.get("retired") or {})
-    except (OSError,ValueError,TypeError):pass
-    try:
-        payload["open_positions"]=len(client().get_all_positions())
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-        payload["open_orders"]=len(client().get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN,limit=100)))
-    except Exception:payload.update(status="degraded",open_positions=None,open_orders=None)
-    return jsonify(payload),(200 if payload["status"]=="ok" else 503)
-def account_data():
-    a=client().get_account(); fields=("id","status","currency","cash","portfolio_value","equity","last_equity","buying_power","daytrading_buying_power","regt_buying_power","trading_blocked","transfers_blocked","account_blocked","pattern_day_trader","daytrade_count")
-    result={**{f:serial(getattr(a,f,None)) for f in fields},"connected":True,"mode":"paper" if paper() else "live"}
-    equity,last=number(result.get("equity")),number(result.get("last_equity"));raw_equity=equity
-    result["day_profit"]=(equity-last) if equity is not None and last is not None else None
-    result["day_profit_pct"]=((equity-last)/last*100) if equity is not None and last not in (None,0) else None
-    saved=load_state();starting=number(saved.get("requested_investment"));baseline=number(saved.get("baseline_equity"))
-    if raw_equity is not None and baseline is not None and starting not in (None,0):
-        strategy_profit=raw_equity-baseline;result["broker_equity"]=result.get("equity");result["broker_portfolio_value"]=result.get("portfolio_value");result["equity"]=starting+strategy_profit;result["portfolio_value"]=starting+strategy_profit;result["day_profit"]=strategy_profit;result["day_profit_pct"]=strategy_profit/starting*100
-        equity=starting+strategy_profit
-    result["total_profit"]=(equity-starting) if equity is not None and starting not in (None,0) else None
-    result["total_profit_pct"]=((equity-starting)/starting*100) if equity is not None and starting not in (None,0) else None
-    return result
-@app.get("/api/account")
-def account():
-    try:return jsonify(cached("account",10,account_data))
-    except Exception as exc:return upstream(exc,"get_account","/v2/account")
-def position_rows():
-    fields=("asset_id","symbol","exchange","asset_class","qty","side","market_value","cost_basis","unrealized_pl","unrealized_plpc","current_price","lastday_price","change_today","avg_entry_price")
-    rows=[];tracked={p["symbol"]:p for p in engine.public_state()["positions"]}
-    for p in client().get_all_positions():
-        row={f:serial(getattr(p,f,None)) for f in fields}
-        qty=number(row.get("qty")); entry=number(row.get("avg_entry_price")); current=number(row.get("current_price")); cost=number(row.get("cost_basis"))
-        if entry is None and qty not in (None,0) and cost is not None:entry=cost/qty
-        if entry and current:
-            guard=protected_state(entry,current,tracked.get(str(row.get("symbol")),{}).get("peak_price"))
-            row.update({k:round(v,6) if isinstance(v,float) else v for k,v in guard.items()})
-        rows.append(row)
-    return rows
-@app.get("/api/engine")
-def engine_status():return jsonify(engine.public_state())
-@app.get("/api/positions")
-def positions():
-    try:r=cached("positions",8,position_rows);return jsonify(positions=r,count=len(r),timestamp=now())
-    except Exception as exc:return upstream(exc,"get_positions","/v2/positions")
-@app.get("/api/orders")
-def orders():
-    try:
-        status=request.args.get("status","all").lower()
-        if status not in {"all","open","closed"}:return error("status must be all, open, or closed")
-        def get():
-            from alpaca.trading.enums import QueryOrderStatus
-            from alpaca.trading.requests import GetOrdersRequest
-            return [serial(o) for o in client().get_orders(filter=GetOrdersRequest(status={"all":QueryOrderStatus.ALL,"open":QueryOrderStatus.OPEN,"closed":QueryOrderStatus.CLOSED}[status],limit=100))]
-        r=cached("orders:"+status,8,get);return jsonify(orders=r,count=len(r),timestamp=now())
-    except Exception as exc:return upstream(exc,"get_orders","/v2/orders")
-@app.get("/api/portfolio-history")
-def history():
-    period=request.args.get("period","1D");frame=request.args.get("timeframe","5Min")
-    if period not in {"1D","1W","1M","3M","1A"} or frame not in {"1Min","5Min","15Min","1H","1D"}:return error("Unsupported history period or timeframe")
-    try:
-        def get():
-            from alpaca.trading.requests import GetPortfolioHistoryRequest
-            h=client().get_portfolio_history(GetPortfolioHistoryRequest(period=period,timeframe=frame,extended_hours=True))
-            return {"timestamp":serial(h.timestamp),"equity":serial(h.equity),"profit_loss":serial(h.profit_loss),"profit_loss_pct":serial(h.profit_loss_pct),"base_value":serial(h.base_value),"period":period,"timeframe":frame}
-        return jsonify(cached(f"history:{period}:{frame}",30,get))
-    except Exception as exc:return upstream(exc,"get_portfolio_history","/v2/account/portfolio/history")
-@app.get("/api/config")
-def get_config():
-    s=load_state();return jsonify(**{k:s[k] for k in ("allocation","daily_goal","updated_at")})
-def nonnegative(v,label):
-    n=number(v)
-    if n is None or n<0:raise ValueError(f"{label} must be a finite, nonnegative number")
-    return n
-@app.post("/api/config")
-@rate_limit()
-def set_config():
-    body=request.get_json(silent=True)
-    if not isinstance(body,dict):return error("A JSON object is required")
-    s=load_state()
-    try:
-        if "allocation" in body:s["allocation"]=nonnegative(body["allocation"],"allocation")
-        if "daily_goal" in body:s["daily_goal"]=nonnegative(body["daily_goal"],"daily_goal")
-    except ValueError as exc:return error(str(exc))
-    save_state(s);s=load_state();return jsonify(**{k:s[k] for k in ("allocation","daily_goal","updated_at")})
-@app.post("/api/scan")
-@rate_limit(6)
-def scan():
-    try:
-        count=int((request.get_json(silent=True) or {}).get("count",50))
-        if not 1<=count<=200:raise ValueError
-        r=cached(f"scan:{count}",300,lambda:build_watchlist(count));s=load_state();s.update(last_scan=r.get("generated_at",now()),last_error=None);save_state(s);return jsonify(r)
-    except (TypeError,ValueError):return error("count must be an integer from 1 through 200")
-    except Exception as exc:
-        s=load_state();s["last_error"]="Market scan unavailable";save_state(s);app.logger.warning("scan failure: %s",type(exc).__name__);return error("Market scan is temporarily unavailable",503)
-def status_data():
-    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"allocation":st["allocation"],"investment_amount":st["requested_investment"],"daily_goal":st["daily_goal"],"exit_status":st["exit_status"],"exit_request_id":st["exit_request_id"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
-@app.get("/api/status")
-def status():return jsonify(status_data())
-@app.get("/api/alerts")
-def alerts():
-    out=[];s=load_state()
-    if s["last_error"]:out.append({"level":"error","code":"LAST_ERROR","message":s["last_error"]})
-    try:
-        a=cached("account",10,account_data)
-        for field,message in (("account_blocked","Alpaca account is blocked"),("trading_blocked","Trading is blocked"),("transfers_blocked","Transfers are blocked")):
-            if a.get(field) is True:out.append({"level":"critical","code":field.upper(),"message":message})
-    except Exception:out.append({"level":"warning","code":"BROKER_UNAVAILABLE","message":"Broker status is unavailable"})
-    return jsonify(alerts=out,count=len(out),timestamp=now())
-@app.get("/api/dashboard")
-def dashboard_data():
-    st=load_state();r={"status":status_data(),"config":{"allocation":st["allocation"],"daily_goal":st["daily_goal"]},"timestamp":now(),"errors":[]}
-    try:r["account"]=cached("account",10,account_data)
-    except Exception:r["account"]=None;r["errors"].append("account")
-    try:r["positions"]=cached("positions",8,position_rows)
-    except Exception:r["positions"]=None;r["errors"].append("positions")
-    r["positions_count"]=len(r["positions"]) if isinstance(r["positions"],list) else None;r["watchlist"]=st.get("selected_watchlist") or []
-    r.update(trades_today=None,win_rate=None,trades=[],performance=[])
-    try:
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-        orders=[serial(o) for o in client().get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED,limit=100))]
-        today=datetime.now(timezone.utc).date();filled=[];all_filled=[]
-        for order in orders:
-            stamp=order.get("filled_at")
-            try:is_today=datetime.fromisoformat(str(stamp).replace("Z","+00:00")).astimezone(timezone.utc).date()==today
-            except (TypeError,ValueError):is_today=False
-            if order.get("filled_qty") not in (None,"0",0):
-                all_filled.append(order)
-                if is_today:filled.append(order)
-        r["trades"]=[{"symbol":o.get("symbol"),"side":o.get("side"),"qty":o.get("filled_qty"),"price":o.get("filled_avg_price"),"timestamp":o.get("filled_at"),"status":o.get("status")} for o in all_filled]
-        r["trades_today"]=len(filled)
-        try:
-            retired=lifecycle_for(client())._load().get("retired",{});wins=0
-            for symbol,lot in retired.items():
-                if not lot.get("exit_price"):continue
-                r["trades"].extend([{"symbol":symbol,"side":"buy","qty":lot.get("qty"),"price":lot.get("entry_price"),"timestamp":lot.get("entry_at"),"status":"filled"},{"symbol":symbol,"side":"sell","qty":lot.get("qty"),"price":lot.get("exit_price"),"timestamp":lot.get("exited_at"),"status":"filled"}])
-                if number(lot.get("exit_price"))>=number(lot.get("entry_price")):wins+=1
-            r["win_rate"]=(wins/len(retired)*100) if retired else None
-        except Exception:r["errors"].append("lifecycle_history")
-    except Exception:r["errors"].append("orders")
-    try:
-        from alpaca.trading.requests import GetPortfolioHistoryRequest
-        h=client().get_portfolio_history(GetPortfolioHistoryRequest(period="1D",timeframe="5Min",extended_hours=True))
-        stamps,values=serial(h.timestamp),serial(h.equity)
-        r["history"]=[{"timestamp":t,"equity":v} for t,v in zip(stamps,values)]
-        if values:
-            first,last=number(values[0]),number(values[-1])
-            r["performance"]=[{"label":"Today","profit":(last-first) if None not in (first,last) else None,"return_pct":((last-first)/first*100) if first not in (None,0) and last is not None else None,"trades":r["trades_today"]}]
-    except Exception:r["history"]=[];r["errors"].append("history")
-    alerts_=[]
-    if st["last_error"]:alerts_.append({"type":"error","message":st["last_error"]})
-    if truthy("MOSQUITO_ENABLE_SIMULATION"):
-        try:r["green_ribbon"]=cached("green_ribbon",60,simulator.value)
-        except Exception:r["green_ribbon"]={"status":"UNAVAILABLE","error":"Paper simulation prices are temporarily unavailable"};r["errors"].append("green_ribbon")
-    else:r["green_ribbon"]={"status":"DISABLED"}
-    r["alerts"]=alerts_;r["alerts_count"]=len(alerts_)
-    return jsonify(r)
-@app.post("/api/bot/start")
-@rate_limit()
-def start():
-    s=load_state();body=request.get_json(silent=True) or {}
-    try:req=nonnegative(body.get("allocation",body.get("investment_amount",s["requested_investment"])),"allocation")
-    except ValueError as exc:return error(str(exc))
-    if req<=0:return error("allocation must be greater than zero")
-    s["requested_investment"]=req
-    try:save_state(s)
-    except OSError as exc:
-        app.logger.error("state persistence failure: %s",type(exc).__name__)
-        return error("Bot state could not be saved",500)
-    try:
-        bp=number(cached("account",1,account_data).get("buying_power"))
-        if bp is None:
-            s["last_error"]="Buying power is unavailable";save_state(s)
-            return error("Buying power is unavailable",409)
-        allocation=min(req,max(0,bp))
-        if allocation<=0:
-            s["last_error"]="No buying power is available";save_state(s)
-            return error("No buying power is available",409)
-    except Exception as exc:
-        s["last_error"]="Broker service is temporarily unavailable"
-        try:save_state(s)
-        except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
-        return upstream(exc,"start_bot_get_account","/v2/account")
-    already=bool(s["running"]);s.update(running=True,armed=True,allocation=allocation,last_error=None)
-    simulation=None
-    if truthy("MOSQUITO_ENABLE_SIMULATION"):
-        try:simulation=simulator.begin(allocation)
-        except Exception as exc:
-            s.update(running=False,last_error="V5.8 paper simulation could not start");save_state(s);app.logger.warning("simulation start failure: %s",type(exc).__name__);return error("V5.8 paper simulation could not start",503)
-    try:save_state(s)
-    except OSError as exc:
-        app.logger.error("state persistence failure: %s",type(exc).__name__)
-        return error("Bot state could not be saved",500)
-    with LOCK:CACHE.clear()
-    ensure_runtime()
-    return jsonify(ok=True,running=True,already_running=already,allocation=allocation,requested_allocation=req,capped=allocation<req,execution_enabled=enabled(),simulation_enabled=bool(simulation),mode="paper" if paper() else "live",timestamp=now())
-@app.post("/api/bot/stop")
-@rate_limit()
-def stop():
-    s=load_state();already=not bool(s["running"]);s.update(running=False,armed=False)
-    if truthy("MOSQUITO_ENABLE_SIMULATION"):simulator.stop()
-    try:save_state(s)
-    except OSError as exc:
-        app.logger.error("state persistence failure: %s",type(exc).__name__)
-        return error("Bot state could not be saved",500)
-    return jsonify(ok=True,running=False,already_stopped=already,positions_unchanged=True,
-        message="New entries are stopped; existing positions were not changed",timestamp=now())
-@app.post("/api/bot/exit")
-@rate_limit(5)
-def exit_bot():
-    body=request.get_json(silent=True)
-    if not isinstance(body,dict) or body.get("confirm")!="EXIT ALL POSITIONS":
-        return error('confirmation is required; send {"confirm":"EXIT ALL POSITIONS"}',400)
-    if truthy("MOSQUITO_ENABLE_SIMULATION") and not body.get("broker_exit"):
-        try:
-            report=simulator.exit_all();completed=bool(report.get("completed",True));status="completed" if completed else "partially_blocked"
-            message="Mosquito simulated positions were closed" if completed else "Profitable positions were closed; positions below purchase price remain held"
-            s=load_state();s.update(running=not completed,exit_status=status,last_error=None);save_state(s);CACHE.clear()
-            return jsonify(ok=completed,running=not completed,executed=True,submitted=False,completed=completed,status=status,message=message,green_ribbon=report,timestamp=now()),(200 if completed else 409)
-        except Exception as exc:app.logger.warning("simulation exit failure: %s",type(exc).__name__);return error("Simulated positions could not be closed",503)
-    request_id=str(body.get("request_id","")).strip()
-    if len(request_id)>128:return error("request_id must be 128 characters or fewer")
-    if request_id:
-        with LOCK:
-            prior=EXIT_RESULTS.get(request_id)
-        if prior:
-            http_status=prior["http_status"]
-            return jsonify({k:v for k,v in prior.items() if k!="http_status"}),http_status
-    if not EXIT_LOCK.acquire(blocking=False):
-        return error("An exit request is already in progress",409)
-    try:
-        s=load_state();s.update(running=False,exit_status="requested",exit_request_id=request_id or None,last_error=None)
-        try:save_state(s)
-        except OSError as exc:
-            app.logger.error("state persistence failure: %s",type(exc).__name__)
-            return error("Bot state could not be saved; no broker request was sent",500)
-        if not enabled():
-            s.update(exit_status="blocked",last_error="Exit was not submitted because broker execution is disabled")
-            try:save_state(s)
-            except OSError as exc:app.logger.error("state persistence failure: %s",type(exc).__name__)
-            return jsonify(ok=False,running=False,executed=False,submitted=False,completed=False,
-                status="blocked",message="Exit was not submitted because broker execution is disabled",timestamp=now()),409
-        broker=client(); positions=broker.get_all_positions(); rows=[];failures=[];blocked=[]
-        from alpaca.trading.enums import OrderSide,TimeInForce
-        from alpaca.trading.requests import LimitOrderRequest
-        for p in positions:
-            symbol=str(getattr(p,"symbol",""));qty=number(getattr(p,"qty",None));entry=number(getattr(p,"avg_entry_price",None));current=number(getattr(p,"current_price",None))
-            if not symbol or qty is None or qty<=0 or entry is None or current is None:
-                failures.append({"symbol":symbol or "unknown","reason":"position data unavailable"});continue
-            guard=protected_state(entry,current)
-            if guard["below_entry"]:
-                blocked.append({"symbol":symbol,"qty":qty,**guard});continue
-            try:
-                order=broker.submit_order(order_data=LimitOrderRequest(symbol=symbol,qty=qty,side=OrderSide.SELL,time_in_force=TimeInForce.DAY,limit_price=guard["protected_floor"],client_order_id=f"mosquito-exit-{symbol}-{int(time.time())}"))
-                rows.append({"symbol":symbol,"qty":qty,"entry_price":entry,"current_price":current,"limit_price":guard["protected_floor"],"status":serial(getattr(order,"status","accepted")),"order_id":serial(getattr(order,"id",None)),"reason":"OWNER_PROTECTED_EXIT"})
-            except Exception:
-                failures.append({"symbol":symbol,"reason":"broker rejected protected limit order"})
-        status="partial_failure" if failures else "partially_blocked" if blocked else "pending"
-        message=("Some protected limit orders were rejected; verify the remaining positions" if failures else
-            "Profitable positions received protected limit orders; below-purchase positions remain held" if blocked else
-            "Protected limit orders were accepted by Alpaca and are pending; completion has not been verified")
-        s.update(exit_status=status,last_error=message if failures else None)
-        try:save_state(s)
-        except OSError as exc:app.logger.error("state persistence failure: %s",type(exc).__name__)
-        payload={"ok":not failures,"running":False,"executed":True,"submitted":True,"completed":False,
-            "status":status,"message":message,"results":rows,"failures":failures,"blocked_below_purchase":blocked,
-            "mode":"paper" if paper() else "live","request_id":request_id or None,"timestamp":now()}
-        http_status=502 if failures else 409 if blocked else 202
-        if request_id:
-            with LOCK:EXIT_RESULTS[request_id]={**payload,"http_status":http_status}
-        with LOCK:CACHE.clear()
-        return jsonify(payload),http_status
-    except Exception as exc:
-        s=load_state();s.update(running=False,exit_status="failed",last_error="Broker rejected or could not process the exit request")
-        try:save_state(s)
-        except OSError as state_exc:app.logger.error("state persistence failure after broker error: %s",type(state_exc).__name__)
-        with LOCK:CACHE.clear()
-        return upstream(exc,"exit_bot")
-    finally:EXIT_LOCK.release()
-if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
+ëN}Õ½ÕæšsyšŠz+Š§þf¢Ý^i§7Õý·ë§øÓ×ykŽtÛ­¹ÝÞ=ÓÖ÷wÝ:k—»ë½º{ßZã½ã·ôyç}åÞ5ß¾ûÓž]Û[Øˆˆ‰AÉ½‘ÕÑ¥½¸A$™½È5½ÍÅÕ¥Ñ¼IÕ¹¹•ÈìÁ…Á•ÈµÍ…™”‰ä‘•™…Õ±Ð¸ˆˆˆ)™É½´}}™ÕÑÕÉ•}|¥µÁ½ÉÐ…¹¹½Ñ…Ñ¥½¹Ì)¥µÁ½ÉÐ½¹ÕÉÉ•¹Ð¹™ÕÑÕÉ•Ì±¡…Í¡±¥ˆ±¡µ…Œ±©Í½¸±µ…Ñ ±½Ì±É”±Ñ•µÁ™¥±”±Ñ¡É•…‘¥¹œ±Ñ¥µ”)™É½´½±±•Ñ¥½¹Ì¥µÁ½ÉÐ‘•™…Õ±Ñ‘¥Ð±‘•ÅÕ”)™É½´‘…Ñ•Ñ¥µ”¥µÁ½ÉÐ‘…Ñ”±‘…Ñ•Ñ¥µ”±Ñ¥µ•‘•±Ñ„±Ñ¥µ•é½¹”)™É½´™Õ¹Ñ½½±Ì¥µÁ½ÉÐÝÉ…ÁÌ)™É½´Á…Ñ¡±¥ˆ¥µÁ½ÉÐA…Ñ )™É½´™±…Í¬¥µÁ½ÉÐ±…Í¬±©Í½¹¥™ä±µ…­•}É•ÍÁ½¹Í”±É•ÅÕ•ÍÐ±Í•¹‘}™É½µ}‘¥É•Ñ½Éä±É•‘¥É•Ð)™É½´ÍÑÉ…Ñ•ä¥µÁ½ÉÐ%}U9%YIM±‰Õ¥±‘}Ý…Ñ¡±¥ÍÐ±É…¹­}Ý…Ñ¡±¥ÍÐ)¥µÁ½ÉÐÍ¥µÕ±…Ñ½È)¥µÁ½ÉÐ•¹¥¹”)™É½´ÁÉ½Ñ•Ñ¥½¸¥µÁ½ÉÐÁÉ½Ñ•Ñ•‘}ÍÑ…Ñ”)™É½´±¥™•å±”¥µÁ½ÉÐ1¥™•å±”)™É½´Í¡•‘Õ±•È¥µÁ½ÉÐ5…É­•ÑM¡•‘Õ±•È±I•ÑÉåA•¹‘¥¹œ()…ÁÀõ±…Í¬¡}}¹…µ•}|±ÍÑ…Ñ¥}™½±‘•Èõ9½¹”¤ì…ÁÀ¹½¹™¥l‰5a}=9Q9Q}19Q ‰tôØÔÔÌØ)1=,õÑ¡É•…‘¥¹œ¹I1½¬ ¤ìa%Q}1=,õÑ¡É•…‘¥¹œ¹1½¬ ¤ì!õíôì11Lõ‘•™…Õ±Ñ‘¥Ð¡‘•ÅÕ”¤ìa%Q}IMU1QLõíô)9%9}Q!Iõ9½¹”í9%9}Q!I}1=,õÑ¡É•…‘¥¹œ¹1½¬ ¤íM!U1I}Q!Iõ9½¹”íM!U1I}Q!I}1=,õÑ¡É•…‘¥¹œ¹1½¬ ¤íIU9Q%5}MQ=@õÑ¡É•…‘¥¹œ¹Ù•¹Ð ¤)IMQ}Q!Iõ9½¹”íIMQ}Q!I}1=,õÑ¡É•…‘¥¹œ¹1½¬ ¤)	I=-I}!1Q!}1=,õÑ¡É•…‘¥¹œ¹1½¬ ¤í	I=-I}!1Q!}UQUIõ9½¹”í	I=-I}!1Q!}!õ9½¹”í	I=-I}!1Q!}aA%ILôÀ¸À)	I=-I}!1Q!}A==0õ½¹ÕÉÉ•¹Ð¹™ÕÑÕÉ•Ì¹Q¡É•…‘A½½±á•ÕÑ½È¡µ…á}Ý½É­•ÉÌôÄ±Ñ¡É•…‘}¹…µ•}ÁÉ•™¥àô‰‰É½­•Èµ¡•…±Ñ ˆ¤)MQQ}AQ õA…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}MQQ}%1ˆ°ˆ½ÑµÀ½µ½ÍÅÕ¥Ñ¼µÉÕ¹¹•ÈµÍÑ…Ñ”¹©Í½¸ˆ¤¤)U1QLõì‰…±±½…Ñ¥½¸ˆèÀ¸À°‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹ÐˆèÀ¸À°‰‰…Í•±¥¹•}•ÅÕ¥Ñäˆé9½¹”°‰Í•±•Ñ¥½¹}Õ¹¥Ù•ÉÍ”ˆémt°‰Í•±•Ñ•‘}Ý…Ñ¡±¥ÍÐˆémt°‰±…ÍÑ}ÅÕ…±¥™¥•‘}½Õ¹Ðˆé9½¹”°‰‘…¥±å}½…°ˆèÔÀÀ¸À°‰ÉÕ¹¹¥¹œˆé…±Í”°‰…Éµ•ˆéQÉÕ”°‰•á¥Ñ}ÍÑ…ÑÕÌˆé9½¹”°‰•á¥Ñ}É•ÅÕ•ÍÑ}¥ˆé9½¹”°‰±…ÍÑ}Í…¸ˆé9½¹”°‰±…ÍÑ}•ÉÉ½Èˆé9½¹”°‰ÕÁ‘…Ñ•‘}…Ðˆé9½¹•ô)‘•˜¹½Ü ¤èÉ•ÑÕÉ¸‘…Ñ•Ñ¥µ”¹¹½Ü¡Ñ¥µ•é½¹”¹ÕÑŒ¤¹¥Í½™½Éµ…Ð ¤)‘•˜ÑÉÕÑ¡ä¡¹…µ”¤èÉ•ÑÕÉ¸½Ì¹•Ñ•¹Ø¡¹…µ”°ˆˆ¤¹±½Ý•È ¤¥¸ìˆÄˆ°‰ÑÉÕ”ˆ°‰å•Ìˆ°‰½¸‰ô)‘•˜Á…Á•È ¤èÉ•ÑÕÉ¸QÉÕ”)‘•˜•¹…‰±• ¤èÉ•ÑÕÉ¸ÑÉÕÑ¡ä ‰1A}9	1}=II}aUQ%=8ˆ¤)‘•˜}Í…™•}±½}Ñ•áÐ¡Ù…±Õ”¤è(€€€Ñ•áÐõÍÑÈ¡Ù…±Õ”½È€ˆˆ¥lèÌÀÁt¹É•Á±…” ‰qÈˆ°ˆ€ˆ¤¹É•Á±…” ‰q¸ˆ°ˆ€ˆ¤(€€€™½È¹…µ”¥¸€ ‰1A}A%}-dˆ°‰1A}A%}-e}%ˆ°‰A}A%}-e}%ˆ°‰1A}MIQ}-dˆ°‰1A}A%}MIQ}-dˆ°‰A}A%}MIQ}-dˆ¤è(€€€€€€€Í•É•Ðõ½Ì¹•Ñ•¹Ø¡¹…µ”¤(€€€€€€€¥˜Í•É•ÐéÑ•áÐõÑ•áÐ¹É•Á±…”¡Í•É•Ð°‰mIQtˆ¤(€€€Ñ•áÐõÉ”¹ÍÕˆ¡Èˆ ý¤¤¡…ÕÑ¡½É¥é…Ñ¥½¹ñ…Á¥lµ|tý­•åñÍ•É•ÑñÑ½­•¸¤¡qÌ©lèõuqÌ¨¤¡mx°ìt¬¤ˆ±È‰pÅpÉmIQtˆ±Ñ•áÐ¤(€€€É•ÑÕÉ¸Ñ•áÐ)‘•˜±½}‰É½­•É}•ÉÉ½È¡•áŒ±½Á•É…Ñ¥½¸±•¹‘Á½¥¹Ðõ9½¹”¤è(€€€™¥•±‘Ìõì‰•ÉÉ½É}±…ÍÌˆéÑåÁ”¡•áŒ¤¹}}¹…µ•}|°‰½Á•É…Ñ¥½¸ˆé½Á•É…Ñ¥½¹ô(€€€¥˜•¹‘Á½¥¹Ðé™¥•±‘Íl‰•¹‘Á½¥¹Ð‰tõ•¹‘Á½¥¹Ð(€€€ÑÉäè(€€€€€€€™É½´…±Á…„¹½µµ½¸¹•á•ÁÑ¥½¹Ì¥µÁ½ÉÐA%ÉÉ½È(€€€€€€€¥˜¥Í¥¹ÍÑ…¹”¡•áŒ±A%ÉÉ½È¤è(€€€€€€€€€€€™½È¹…µ”¥¸€ ‰ÍÑ…ÑÕÍ}½‘”ˆ°‰½‘”ˆ°‰µ•ÍÍ…”ˆ¤è(€€€€€€€€€€€€€€€ÑÉäéÙ…±Õ”õ•Ñ…ÑÑÈ¡•áŒ±¹…µ”±9½¹”¤(€€€€€€€€€€€€€€€•á•ÁÐá•ÁÑ¥½¸éÙ…±Õ”õ9½¹”(€€€€€€€€€€€€€€€¥˜Ù…±Õ”¹½Ð¥¸€¡9½¹”°ˆˆ¤é™¥•±‘Ím¹…µ•tõ}Í…™•}±½}Ñ•áÐ¡Ù…±Õ”¤(€€€•á•ÁÐ%µÁ½ÉÑÉÉ½ÈéÁ…ÍÌ(€€€…ÁÀ¹±½•È¹Ý…É¹¥¹œ ‰‰É½­•È™…¥±ÕÉ”€•Ìˆ±©Í½¸¹‘ÕµÁÌ¡™¥•±‘Ì±Í•Á…É…Ñ½ÉÌô ˆ°ˆ°ˆèˆ¤±Í½ÉÑ}­•åÌõQÉÕ”¤¤)‘•˜•¹¥¹•}±½½À ¤è(€€€Ý¡¥±”QÉÕ”è(€€€€€€€ÑÉäè(€€€€€€€€€€€¥˜±½…‘}ÍÑ…Ñ” ¤¹•Ð ‰ÉÕ¹¹¥¹œˆ¤è(€€€€€€€€€€€€€€€‰É½­•Èõ±¥•¹Ð ¤í±¥™”õ±¥™•å±•}™½È¡‰É½­•È¤í±¥™”¹É•½¹¥±” ¤í•¹¥¹”¹å±”¡‰É½­•È±ÍÕ‰µ¥Ñ}•¹…‰±•õ•¹…‰±• ¤¤íÉ•½¹¥±•}±½Í•‘}Á½Í¥Ñ¥½¹Ì¡‰É½­•È±±¥™”¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒé±½}‰É½­•É}•ÉÉ½È¡•áŒ°‰ÑÉ…¥±¥¹}•¹¥¹•}å±”ˆ¤(€€€€€€€¥˜IU9Q%5}MQ=@¹Ý…¥Ð¡µ…à È±¹Õµ‰•È¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}9%9}%9QIY0ˆ¤¤½È€Ô¤¤é‰É•…¬)‘•˜•¹ÍÕÉ•}•¹¥¹” ¤è(€€€±½‰…°9%9}Q!I(€€€Ý¥Ñ 9%9}Q!I}1=,è(€€€€€€€¥˜9%9}Q!I¥Ì9½¹”½È¹½Ð9%9}Q!I¹¥Í}…±¥Ù” ¤è(€€€€€€€€€€€9%9}Q!IõÑ¡É•…‘¥¹œ¹Q¡É•…¡Ñ…É•Ðõ•¹¥¹•}±½½À±¹…µ”ô‰µ½ÍÅÕ¥Ñ¼µÑÉ…¥±¥¹œµ•¹¥¹”ˆ±‘…•µ½¸õQÉÕ”¤í9%9}Q!I¹ÍÑ…ÉÐ ¤)‘•˜É•‘•¹Ñ¥…±Ì ¤è(€€€É•ÑÕÉ¸€¡½Ì¹•Ñ•¹Ø ‰1A}A%}-dˆ¤½È½Ì¹•Ñ•¹Ø ‰1A}A%}-e}%ˆ¤½È½Ì¹•Ñ•¹Ø ‰A}A%}-e}%ˆ¤±½Ì¹•Ñ•¹Ø ‰1A}MIQ}-dˆ¤½È½Ì¹•Ñ•¹Ø ‰1A}A%}MIQ}-dˆ¤½È½Ì¹•Ñ•¹Ø ‰A}A%}MIQ}-dˆ¤¤)‘•˜±¥•¹Ð ¤è(€€€­•ä±Í•É•ÐõÉ•‘•¹Ñ¥…±Ì ¤(€€€¥˜¹½Ð­•ä½È¹½ÐÍ•É•ÐèÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰µ¥ÍÍ¥¹œÉ•‘•¹Ñ¥…±Ìˆ¤(€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹±¥•¹Ð¥µÁ½ÉÐQÉ…‘¥¹±¥•¹Ð(€€€É•ÑÕÉ¸QÉ…‘¥¹±¥•¹Ð¡­•ä±Í•É•Ð±Á…Á•ÈõÁ…Á•È ¤¤)‘•˜}‰É½­•É}¡•…±Ñ¡}ÁÉ½‰” ¤è(€€€‰É½­•Èõ±¥•¹Ð ¤í‰É½­•È¹•Ñ}…½Õ¹Ð ¤í‰É½­•È¹•Ñ}±½¬ ¤(€€€É•ÑÕÉ¸QÉÕ”)‘•˜‰É½­•É}¡•…±Ñ¡}‘…Ñ„ ¤è(€€€±½‰…°	I=-I}!1Q!}UQUI±	I=-I}!1Q!}!±	I=-I}!1Q!}aA%IL(€€€¡•­•‘}…Ðõ¹½Ü ¤í­•ä±Í•É•ÐõÉ•‘•¹Ñ¥…±Ì ¤(€€€¥˜¹½Ð­•ä½È¹½ÐÍ•É•ÐéÉ•ÑÕÉ¸ì‰ÍÑ…ÑÕÌˆè‰‘•É…‘•ˆ°‰½¹™¥ÕÉ•ˆé…±Í”°‰…ÕÑ¡•¹Ñ¥…Ñ•ˆé…±Í”°‰…½Õ¹Ñ}É•…‘…‰±”ˆé…±Í”°‰±½­}É•…‘…‰±”ˆé…±Í”°‰Á…Á•É}µ½‘”ˆéÁ…Á•È ¤°‰¡•­•‘}…Ðˆé¡•­•‘}…Ñô(€€€Ý¥Ñ 	I=-I}!1Q!}1=,è(€€€€€€€¥˜	I=-I}!1Q!}!¥Ì¹½Ð9½¹”…¹	I=-I}!1Q!}aA%ILùÑ¥µ”¹µ½¹½Ñ½¹¥Œ ¤éÉ•ÑÕÉ¸‘¥Ð¡	I=-I}!1Q!}!¤(€€€€€€€¥˜	I=-I}!1Q!}UQUI¥Ì9½¹”½È	I=-I}!1Q!}UQUI¹‘½¹” ¤é	I=-I}!1Q!}UQUIõ	I=-I}!1Q!}A==0¹ÍÕ‰µ¥Ð¡}‰É½­•É}¡•…±Ñ¡}ÁÉ½‰”¤(€€€€€€€™ÕÑÕÉ”õ	I=-I}!1Q!}UQUI(€€€Ñ¥µ•½ÕÐõµ…à ¸ÈÔ±µ¥¸ Ô¸À±¹Õµ‰•È¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}	I=-I}!1Q!}Q%5=UPˆ¤¤½È€È¸À¤¤(€€€ÑÉäè(€€€€€€€™ÕÑÕÉ”¹É•ÍÕ±Ð¡Ñ¥µ•½ÕÐõÑ¥µ•½ÕÐ¤(€€€€€€€É•ÍÕ±Ðõì‰ÍÑ…ÑÕÌˆè‰½¬ˆ°‰½¹™¥ÕÉ•ˆéQÉÕ”°‰…ÕÑ¡•¹Ñ¥…Ñ•ˆéQÉÕ”°‰…½Õ¹Ñ}É•…‘…‰±”ˆéQÉÕ”°‰±½­}É•…‘…‰±”ˆéQÉÕ”°‰Á…Á•É}µ½‘”ˆéÁ…Á•È ¤°‰¡•­•‘}…Ðˆé¡•­•‘}…Ñô(€€€€€€€ÑÑ°ôÌÀ¸À(€€€•á•ÁÐ½¹ÕÉÉ•¹Ð¹™ÕÑÕÉ•Ì¹Q¥µ•½ÕÑÉÉ½Èè(€€€€€€€É•ÍÕ±Ðõì‰ÍÑ…ÑÕÌˆè‰‘•É…‘•ˆ°‰½¹™¥ÕÉ•ˆéQÉÕ”°‰…ÕÑ¡•¹Ñ¥…Ñ•ˆé…±Í”°‰…½Õ¹Ñ}É•…‘…‰±”ˆé…±Í”°‰±½­}É•…‘…‰±”ˆé…±Í”°‰Á…Á•É}µ½‘”ˆéÁ…Á•È ¤°‰¡•­•‘}…Ðˆé¡•­•‘}…Ñô(€€€€€€€ÑÑ°ôÔ¸À(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€±½}‰É½­•É}•ÉÉ½È¡•áŒ°‰‰É½­•É}¡•…±Ñ¡}ÁÉ½‰”ˆ°ˆ½ØÈ½…½Õ¹Ð°½ØÈ½±½¬ˆ¤(€€€€€€€É•ÍÕ±Ðõì‰ÍÑ…ÑÕÌˆè‰‘•É…‘•ˆ°‰½¹™¥ÕÉ•ˆéQÉÕ”°‰…ÕÑ¡•¹Ñ¥…Ñ•ˆé…±Í”°‰…½Õ¹Ñ}É•…‘…‰±”ˆé…±Í”°‰±½­}É•…‘…‰±”ˆé…±Í”°‰Á…Á•É}µ½‘”ˆéÁ…Á•È ¤°‰¡•­•‘}…Ðˆé¡•­•‘}…Ñô(€€€€€€€ÑÑ°ôÌÀ¸À(€€€Ý¥Ñ 	I=-I}!1Q!}1=,è(€€€€€€€	I=-I}!1Q!}!õ‘¥Ð¡É•ÍÕ±Ð¤í	I=-I}!1Q!}aA%ILõÑ¥µ”¹µ½¹½Ñ½¹¥Œ ¤­ÑÑ°(€€€€€€€¥˜™ÕÑÕÉ”¹‘½¹” ¤é	I=-I}!1Q!}UQUIõ9½¹”(€€€É•ÑÕÉ¸É•ÍÕ±Ð)±…ÍÌA…Á•É	É½­•É‘…ÁÑ•Èè(€€€Á…Á•ÈõQÉÕ”(€€€‘•˜}}¥¹¥Ñ}|¡Í•±˜±‰É½­•È¤éÍ•±˜¹‰É½­•Èõ‰É½­•È(€€€‘•˜ÍÕ‰µ¥Ñ}½É‘•È¡Í•±˜±É•ÅÕ•ÍÐ¤è(€€€€€€€¥˜¹½Ð•¹…‰±• ¤éÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰‰É½­•È½É‘•È•á•ÕÑ¥½¸¥Ì‘¥Í…‰±•ˆ¤(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐ=É‘•ÉM¥‘”±=É‘•ÉQåÁ”±Q¥µ•%¹½É”(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ5…É­•Ñ=É‘•ÉI•ÅÕ•ÍÐ(€€€€€€€¥˜ÍÑÈ¡É•ÅÕ•ÍÐ¹•Ð ‰Í¥‘”ˆ¤¤¹±½Ý•È ¤„ô‰‰ÕäˆéÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰Á…Á•È±¥™•å±”…•ÁÑÌ‰Õä½É‘•ÉÌ½¹±äˆ¤(€€€€€€€½É‘•Èõ5…É­•Ñ=É‘•ÉI•ÅÕ•ÍÐ¡Íåµ‰½°õÉ•ÅÕ•ÍÑl‰Íåµ‰½°‰t±¹½Ñ¥½¹…°õ™±½…Ð¡É•ÅÕ•ÍÑl‰¹½Ñ¥½¹…°‰t¤±Í¥‘”õ=É‘•ÉM¥‘”¹	Ud±ÑåÁ”õ=É‘•ÉQåÁ”¹5I-P±Ñ¥µ•}¥¹}™½É”õQ¥µ•%¹½É”¹d±±¥•¹Ñ}½É‘•É}¥õÉ•ÅÕ•ÍÑl‰±¥•¹Ñ}½É‘•É}¥‰t¤(€€€€€€€É•ÑÕÉ¸Í•±˜¹‰É½­•È¹ÍÕ‰µ¥Ñ}½É‘•È¡½É‘•É}‘…Ñ„õ½É‘•È¤(€€€‘•˜•Ñ}½É‘•É}‰å}±¥•¹Ñ}¥¡Í•±˜±±¥•¹Ñ}¥¤è(€€€€€€€ÑÉäéÉ•ÑÕÉ¸Í•±˜¹‰É½­•È¹•Ñ}½É‘•É}‰å}±¥•¹Ñ}¥¡±¥•¹Ñ}¥¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸éÉ•ÑÕÉ¸9½¹”)±…ÍÌ	É½­•É±½¬è(€€€‘•˜}}¥¹¥Ñ}|¡Í•±˜±‰É½­•È¤éÍ•±˜¹‰É½­•Èõ‰É½­•È(€€€‘•˜¹½Ü¡Í•±˜¤éÉ•ÑÕÉ¸•Ñ…ÑÑÈ¡Í•±˜¹‰É½­•È¹•Ñ}±½¬ ¤°‰Ñ¥µ•ÍÑ…µÀˆ±9½¹”¤½È‘…Ñ•Ñ¥µ”¹¹½Ü¡Ñ¥µ•é½¹”¹ÕÑŒ¤(€€€‘•˜¥Í}µ…É­•Ñ}½Á•¸¡Í•±˜¤éÉ•ÑÕÉ¸‰½½°¡•Ñ…ÑÑÈ¡Í•±˜¹‰É½­•È¹•Ñ}±½¬ ¤°‰¥Í}½Á•¸ˆ±…±Í”¤¤)‘•˜±¥™•å±•}™½È¡‰É½­•È¤è(€€€µ¥¹ÕÑ•Ìõµ…à À±¹Õµ‰•È¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}I	Ue}==1=]9}5%9UQLˆ¤¤½È€Ô¤(€€€É•ÑÕÉ¸1¥™•å±”¡A…Á•É	É½­•É‘…ÁÑ•È¡‰É½­•È¤±½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}1%e1}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µ±¥™•å±”¹©Í½¸ˆ¤±	É½­•É±½¬¡‰É½­•È¤±Á½ÉÑ™½±¥½}Í¥é”ôÔÀ±É•‰Õå}½½±‘½Ý¸õÑ¥µ•‘•±Ñ„¡µ¥¹ÕÑ•Ìõµ¥¹ÕÑ•Ì¤¤)‘•˜É•½¹¥±•}±½Í•‘}Á½Í¥Ñ¥½¹Ì¡‰É½­•È±±¥™”¤è(€€€‘…Ñ„õ•¹¥¹”¹±½… ¤í¡…¹•õ…±Í”í±½Í•õmt(€€€™½È•Ù•¹Ð¥¸‘…Ñ„¹•Ð ‰•Ù•¹ÑÌˆ±mt¤è(€€€€€€€¥˜•Ù•¹Ð¹•Ð ‰ÑåÁ”ˆ¤„ô‰A=M%Q%=9}1=M}A9%9}I=9%1%Q%=8ˆ½È•Ù•¹Ð¹•Ð ‰É•½¹¥±•ˆ¤é½¹Ñ¥¹Õ”(€€€€€€€½É‘•É}¥õ•Ù•¹Ð¹•Ð ‰½É‘•É}¥ˆ¤(€€€€€€€¥˜¹½Ð½É‘•É}¥é½¹Ñ¥¹Õ”(€€€€€€€ÑÉäé½É‘•Èõ‰É½­•È¹•Ñ}½É‘•É}‰å}¥¡½É‘•É}¥¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸é½¹Ñ¥¹Õ”(€€€€€€€ÍÑ…ÑÕÌõÍÑÈ¡•Ñ…ÑÑÈ¡½É‘•È°‰ÍÑ…ÑÕÌˆ°ˆˆ¤¤¹±½Ý•È ¤íÁÉ¥”õ¹Õµ‰•È¡•Ñ…ÑÑÈ¡½É‘•È°‰™¥±±•‘}…Ù}ÁÉ¥”ˆ±9½¹”¤¤íÅÑäõ¹Õµ‰•È¡•Ñ…ÑÑÈ¡½É‘•È°‰™¥±±•‘}ÅÑäˆ±9½¹”¤¤(€€€€€€€¥˜ÍÑ…ÑÕÌôô‰™¥±±•ˆ…¹ÁÉ¥”…¹ÅÑäè(€€€€€€€€€€€±¥™”¹É•½É‘}•á¥Ð¡•Ù•¹Ñl‰Íåµ‰½°‰t±™¥±±}ÁÉ¥”õÁÉ¥”±™¥±±•‘}…Ðõ•Ñ…ÑÑÈ¡½É‘•È°‰™¥±±•‘}…Ðˆ±9½¹”¤¤í•Ù•¹Ð¹ÕÁ‘…Ñ”¡É•½¹¥±•õQÉÕ”±Í•±±}ÁÉ¥”õÁÉ¥”±™¥±±•‘}ÅÑäõÅÑä±É•½¹¥±•‘}…Ðõ¹½Ü ¤¤í±½Í•¹…ÁÁ•¹¡•Ù•¹Ñl‰Íåµ‰½°‰t¤í¡…¹•õQÉÕ”(€€€¥˜¡…¹•è(€€€€€€€•¹¥¹”¹Í…Ù”¡‘…Ñ„¤(€€€€€€€ÑÉäè(€€€€€€€€€€€Á¥­Ìõ½¹™¥Éµ•‘}•¹ÑÉå}Á¥­Ì¡ÑÉ…‘…‰±•}Á¥­Ì¡‰É½­•È°ØÀ¤¤íÁÉ¥•ÌõíÁl‰Ñ¥­•È‰téÁl‰ÁÉ¥”‰t™½ÈÀ¥¸Á¥­Íôí‰Àõ¹Õµ‰•È¡•Ñ…ÑÑÈ¡‰É½­•È¹•Ñ}…½Õ¹Ð ¤°‰‰Õå¥¹}Á½Ý•Èˆ°À¤¤½È€À(€€€€€€€€€€€±¥™”¹É•‰…±…¹”¡Á¥­Ì±ÁÉ¥•Ì±‰À±‘•…‘}Íåµ‰½±Ìô ¤¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒé±½}‰É½­•É}•ÉÉ½È¡•áŒ°‰É•Á±…•µ•¹Ñ}å±”ˆ¤(€€€€ŒI•½Ù•È„±½Í”•Ù•¸¥˜Ñ¡”ÁÉ½•ÍÌÉ•ÍÑ…ÉÑ•‰•ÑÝ••¸Í•±°ÍÕ‰µ¥ÍÍ¥½¸…¹(€€€€ŒÑ¡”•¹¥¹”Ì‘¥Í…ÁÁ•…É…¹”•Ù•¹Ð¸9•Ù•È¥¹™•È„ÁÉ¥”è½¹±ä„‰É½­•È´(€€€€ŒÉ•Á½ÉÑ•™¥±±•M10µ…äÉ•Ñ¥É”„±½…°™¥±±•±½Ð¸(€€€ÑÉäè(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐEÕ•Éå=É‘•ÉMÑ…ÑÕÌ(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ(€€€€€€€±½…°õ±¥™”¹É•½¹¥±” ¤í…ÑÕ…°õíÍÑÈ¡•Ñ…ÑÑÈ¡À°‰Íåµ‰½°ˆ°ˆˆ¤¤¹ÕÁÁ•È ¤™½ÈÀ¥¸‰É½­•È¹•Ñ}…±±}Á½Í¥Ñ¥½¹Ì ¥ô(€€€€€€€µ¥ÍÍ¥¹œõíÌé±½Ð™½ÈÌ±±½Ð¥¸±½…°¹•Ð ‰Á½Í¥Ñ¥½¹Ìˆ±íô¤¹¥Ñ•µÌ ¤¥˜Ì¹½Ð¥¸…ÑÕ…±ô(€€€€€€€¥˜µ¥ÍÍ¥¹œè(€€€€€€€€€€€±½Í•‘}½É‘•ÉÌõ‰É½­•È¹•Ñ}½É‘•ÉÌ¡™¥±Ñ•Èõ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ¡ÍÑ…ÑÕÌõEÕ•Éå=É‘•ÉMÑ…ÑÕÌ¹1=M±±¥µ¥ÐôÔÀÀ±¹•ÍÑ•õ…±Í”¤¤(€€€€€€€€€€€™½ÈÍåµ‰½°±±½Ð¥¸µ¥ÍÍ¥¹œ¹¥Ñ•µÌ ¤è(€€€€€€€€€€€€€€€…¹‘¥‘…Ñ•Ìõmt(€€€€€€€€€€€€€€€™½È½É‘•È¥¸±½Í•‘}½É‘•ÉÌè(€€€€€€€€€€€€€€€€€€€Í¥‘”õÍÑÈ¡•Ñ…ÑÑÈ¡•Ñ…ÑÑÈ¡½É‘•È°‰Í¥‘”ˆ±9½¹”¤°‰Ù…±Õ”ˆ±•Ñ…ÑÑÈ¡½É‘•È°‰Í¥‘”ˆ°ˆˆ¤¤¤¹±½Ý•È ¤(€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÕÌõÍÑÈ¡•Ñ…ÑÑÈ¡•Ñ…ÑÑÈ¡½É‘•È°‰ÍÑ…ÑÕÌˆ±9½¹”¤°‰Ù…±Õ”ˆ±•Ñ…ÑÑÈ¡½É‘•È°‰ÍÑ…ÑÕÌˆ°ˆˆ¤¤¤¹±½Ý•È ¤(€€€€€€€€€€€€€€€€€€€ÁÉ¥”õ¹Õµ‰•È¡•Ñ…ÑÑÈ¡½É‘•È°‰™¥±±•‘}…Ù}ÁÉ¥”ˆ±9½¹”¤¤í™¥±±•‘}…Ðõ•Ñ…ÑÑÈ¡½É‘•È°‰™¥±±•‘}…Ðˆ±9½¹”¤(€€€€€€€€€€€€€€€€€€€¥˜ÍÑÈ¡•Ñ…ÑÑÈ¡½É‘•È°‰Íåµ‰½°ˆ°ˆˆ¤¤¹ÕÁÁ•È ¤ôõÍåµ‰½°…¹Í¥‘”ôô‰Í•±°ˆ…¹ÍÑ…ÑÕÌôô‰™¥±±•ˆ…¹ÁÉ¥”…¹™¥±±•‘}…Ðé…¹‘¥‘…Ñ•Ì¹…ÁÁ•¹ ¡™¥±±•‘}…Ð±ÁÉ¥”¤¤(€€€€€€€€€€€€€€€¥˜…¹‘¥‘…Ñ•Ìè(€€€€€€€€€€€€€€€€€€€™¥±±•‘}…Ð±ÁÉ¥”õµ…à¡…¹‘¥‘…Ñ•Ì±­•äõ±…µ‰‘„¥Ñ•´é¥Ñ•µlÁt¤í±¥™”¹É•½É‘}•á¥Ð¡Íåµ‰½°±™¥±±}ÁÉ¥”õÁÉ¥”±™¥±±•‘}…Ðõ™¥±±•‘}…Ð¤í±½Í•¹…ÁÁ•¹¡Íåµ‰½°¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒé±½}‰É½­•É}•ÉÉ½È¡•áŒ°‰±½Í•‘}½É‘•É}É•½¹¥±¥…Ñ¥½¸ˆ¤(€€€É•ÑÕÉ¸±½Í•)‘•˜ÑÉ…‘…‰±•}Á¥­Ì¡‰É½­•È±½Õ¹ÐôÔÀ¤è(€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐÍÍ•Ñ±…ÍÌ±ÍÍ•ÑMÑ…ÑÕÌ(€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•ÑÍÍ•ÑÍI•ÅÕ•ÍÐ(€€€…ÍÍ•ÑÌõ‰É½­•È¹•Ñ}…±±}…ÍÍ•ÑÌ¡•ÑÍÍ•ÑÍI•ÅÕ•ÍÐ¡ÍÑ…ÑÕÌõÍÍ•ÑMÑ…ÑÕÌ¹Q%Y±…ÍÍ•Ñ}±…ÍÌõÍÍ•Ñ±…ÍÌ¹UM}EU%Qd¤¤(€€€ÑÉ…‘…‰±”õíÍÑÈ¡•Ñ…ÑÑÈ¡„°‰Íåµ‰½°ˆ°ˆˆ¤¤¹ÕÁÁ•È ¤™½È„¥¸…ÍÍ•ÑÌ¥˜‰½½°¡•Ñ…ÑÑÈ¡„°‰ÑÉ…‘…‰±”ˆ±…±Í”¤¤…¹‰½½°¡•Ñ…ÑÑÈ¡„°‰™É…Ñ¥½¹…‰±”ˆ±…±Í”¤¥ô(€€€…¹‘¥‘…Ñ•ÌõmÍåµ‰½°™½ÈÍåµ‰½°¥¸%}U9%YIM¥˜Íåµ‰½°¥¸ÑÉ…‘…‰±•tí±½Í”±Ù½±Õµ”õ…±Á……}¡¥ÍÑ½Éä¡…¹‘¥‘…Ñ•Ì¤íÝ…Ñ õÉ…¹­}Ý…Ñ¡±¥ÍÐ¡±½Í”±Ù½±Õµ”±µ¥¸ ÈÔÀ°ÈÀÀ­½Õ¹Ð¤±Í½ÕÉ”ô‰…±Á……}‘…¥±å}‰…ÉÌˆ¤(€€€Á¥­Ìõm‘¥Ð¡À¤™½ÈÀ¥¸Ý…Ñ ¹•Ð ‰Á¥­Ìˆ±mt¤¥˜À¹•Ð ‰Ñ¥­•Èˆ¤¥¸ÑÉ…‘…‰±•t(€€€¥˜±•¸¡Á¥­Ì¤ñ½Õ¹ÐéÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È¡˜‰=¹±äí±•¸¡Á¥­Ì¥ô•±¥¥‰±”±Á…„µÑÉ…‘…‰±”XÔ¸à¹…µ•ÌÝ•É”…Ù…¥±…‰±”ˆ¤(€€€™½ÈÉ…¹¬±É½Ü¥¸•¹Õµ•É…Ñ”¡Á¥­Ì°Ä¤éÉ½Ü¹ÕÁ‘…Ñ”¡É…¹¬õÉ…¹¬±•±¥¥‰±”õQÉÕ”¤(€€€É•ÑÕÉ¸Á¥­Ì()‘•˜ÅÕ…±¥™å¥¹}Õ¹¥Ù•ÉÍ•}Á¥­Ì¡‰É½­•È°±¥µ¥ÐôÔÀ°É…¹­•õ9½¹”¤è(€€€€ˆˆ‰I…¹¬Ñ¡”•±¥¥‰±”$Õ¹¥Ù•ÉÍ”°Ñ¡•¸…ÁÁ±äÑ½‘…äÌ±¥Ù”•¹ÑÉä…Ñ”¸((€€€Q¡”•¹ÑÉä…Ñ”µÕÍÐ¹½Ð‰”…ÁÁ±¥•½¹±äÑ¼Ñ¡”™¥ÉÍÐ€ÔÀÉ…¹­•¹…µ•Ìè‘ÕÉ¥¹œ„(€€€µ¥µÍ•ÍÍ¥½¸±…Õ¹ Ñ¡…Ð…¸±•…Ù”Ñ¡”Á½ÉÑ™½±¥¼•µÁÑä•Ù•¸Ñ¡½Õ ±½Ý•ÈµÉ…¹­•(€€€$¹…µ•Ì¡…Ù”…±É•…‘äµ½Ù•Ñ¡É½Õ Ñ¡”½¹™¥ÕÉ•Ñ¡É•Í¡½±¸€I…¹¬ÕÀÑ¼€ÈÔÀ(€€€•±¥¥‰±”¹…µ•Ì™¥ÉÍÐ°…Ñ”Ñ¡…Ð™Õ±°Á½½°ÕÍ¥¹œÑ½‘…äÌ±Á…„½Á•¸½±…Ñ•ÍÐ(€€€ÑÉ…‘”°…¹É•Ñ…¥¸Ñ¡”‰•ÍÐÅÕ…±¥™å¥¹œ¹…µ•Ì¥¸‘•Ñ•Éµ¥¹¥ÍÑ¥ŒÉ…¹¬½É‘•È¸(€€€€ˆˆˆ(€€€É…¹­•€ôÉ…¹­•½ÈÑÉ…‘…‰±•}Á¥­Ì¡‰É½­•È°€ÔÀ¤(€€€É•ÑÕÉ¸½¹™¥Éµ•‘}•¹ÑÉå}Á¥­Ì¡É…¹­•¥léµ…à Ä°µ¥¸¡¥¹Ð¡±¥µ¥Ð¤°€ÔÀ¤¥t)‘•˜•¹ÑÉå}Í¥¹…±}µ•Ð¡Í•ÍÍ¥½¹}½Á•¸±ÕÉÉ•¹Ñ}ÁÉ¥”±Ñ¡É•Í¡½±ôÀ¸ÀÀÄ¤è(€€€€ˆˆ‰I•ÑÕÉ¸ÑÉÕ”½¹±ä…™Ñ•È„ÍÑ½¬…¥¹ÌÑ¡”É•ÅÕ¥É•…µ½Õ¹Ð™É½´Ñ½‘…äÌ½Á•¸¸ˆˆˆ(€€€½Á•¹•õ¹Õµ‰•È¡Í•ÍÍ¥½¹}½Á•¸¤íÕÉÉ•¹Ðõ¹Õµ‰•È¡ÕÉÉ•¹Ñ}ÁÉ¥”¤íÑ¡É•Í¡½±õ¹Õµ‰•È¡Ñ¡É•Í¡½±¤(€€€É•ÑÕÉ¸‰½½°¡½Á•¹•…¹½Á•¹•øÀ…¹ÕÉÉ•¹Ð…¹ÕÉÉ•¹ÐøÀ…¹Ñ¡É•Í¡½±¥Ì¹½Ð9½¹”…¹Ñ¡É•Í¡½±øôÀ…¹ÕÉÉ•¹Ðøõ½Á•¹•¨ Ä­Ñ¡É•Í¡½±¤¤)‘•˜½¹™¥Éµ•‘}•¹ÑÉå}Á¥­Ì¡Á¥­Ì¤è(€€€€ˆˆ‰…¥°µ±½Í•±¥Ù”±Á…„…Ñ”™½È¹•Ü‰ÕåÌìÍÑ…±”½µ¥ÍÍ¥¹œÍ¹…ÁÍ¡½ÑÌ¹•Ù•ÈÅÕ…±¥™ä¸ˆˆˆ(€€€™É½´…±Á…„¹‘…Ñ„¹•¹ÕµÌ¥µÁ½ÉÐ…Ñ…••(€€€™É½´…±Á…„¹‘…Ñ„¹¡¥ÍÑ½É¥…°¥µÁ½ÉÐMÑ½­!¥ÍÑ½É¥…±…Ñ…±¥•¹Ð(€€€™É½´…±Á…„¹‘…Ñ„¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐMÑ½­M¹…ÁÍ¡½ÑI•ÅÕ•ÍÐ(€€€­•ä±Í•É•ÐõÉ•‘•¹Ñ¥…±Ì ¤í™••‘}¹…µ”õ½Ì¹•Ñ•¹Ø ‰1A}Q}ˆ°‰¥•àˆ¤¹±½Ý•È ¤í™••õ…Ñ…••¹M%@¥˜™••‘}¹…µ”ôô‰Í¥Àˆ•±Í”…Ñ…••¹%`(€€€µ…É­•ÐõMÑ½­!¥ÍÑ½É¥…±…Ñ…±¥•¹Ð¡­•ä±Í•É•Ð¤íÑ¡É•Í¡½±õ¹Õµ‰•È¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}9QIe}=9%I5Q%=9}APˆ¤¤(€€€¥˜Ñ¡É•Í¡½±¥Ì9½¹”éÑ¡É•Í¡½±ôÀ¸ÀÀÄ(€€€¥˜Ñ¡É•Í¡½±ðÀ½ÈÑ¡É•Í¡½±øÀ¸ÄÀéÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰•¹ÑÉä½¹™¥Éµ…Ñ¥½¸Ñ¡É•Í¡½±¥Ì½ÕÑÍ¥‘”Ñ¡”Í…™”É…¹”ˆ¤(€€€É½ÝÌõíÍÑÈ¡É½Ü¹•Ð ‰Ñ¥­•Èˆ¤½È€ˆˆ¤¹ÕÁÁ•È ¤é‘¥Ð¡É½Ü¤™½ÈÉ½Ü¥¸Á¥­ÍôíÅÕ…±¥™¥•õmtíÕÑ}¹½Üõ‘…Ñ•Ñ¥µ”¹¹½Ü¡Ñ¥µ•é½¹”¹ÕÑŒ¤(€€€Íåµ‰½±Ìõ±¥ÍÐ¡É½ÝÌ¤(€€€‘•˜Í¹…ÁÍ¡½ÑÍ}™½È¡‰…Ñ ¤è(€€€€€€€€ˆˆ‰%Í½±…Ñ”„‰…½Õ¹…Ù…¥±…‰±”Íåµ‰½°¥¹ÍÑ•…½˜‰±½­¥¹œÑ¡”½Ñ¡•È€Ðä¸ˆˆˆ(€€€€€€€ÑÉäè(€€€€€€€€€€€É•ÑÕÉ¸µ…É­•Ð¹•Ñ}ÍÑ½­}Í¹…ÁÍ¡½Ð¡MÑ½­M¹…ÁÍ¡½ÑI•ÅÕ•ÍÐ¡Íåµ‰½±}½É}Íåµ‰½±Ìõ‰…Ñ ±™••õ™••¤¤½Èíô(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€€€€€±½}‰É½­•É}•ÉÉ½È¡•áŒ°‰•¹ÑÉå}Í¹…ÁÍ¡½Ðˆ±˜‰Íåµ‰½±Ìõí±•¸¡‰…Ñ ¥ôˆ¤(€€€€€€€€€€€¥˜±•¸¡‰…Ñ ¤ðôÄéÉ•ÑÕÉ¸íô(€€€€€€€€€€€µ¥‘‘±”õ±•¸¡‰…Ñ ¤¼¼È(€€€€€€€€€€€É•ÑÕÉ¸ì¨©Í¹…ÁÍ¡½ÑÍ}™½È¡‰…Ñ¡léµ¥‘‘±•t¤°¨©Í¹…ÁÍ¡½ÑÍ}™½È¡‰…Ñ¡mµ¥‘‘±”ét¥ô(€€€‰…Ñ¡•ÌõmÍåµ‰½±Ím½™™Í•Ðé½™™Í•Ð¬ÈÁt™½È½™™Í•Ð¥¸É…¹” À±±•¸¡Íåµ‰½±Ì¤°ÈÀ¥t(€€€€Œ™Õ±°µÕ¹¥Ù•ÉÍ”µ¥‘‘…äÍ…¸µÕÍÐ™¥¹¥Í ‰•™½É”Ñ¡”Í¥¹…°¡…¹•Ì¸•Ñ (€€€€Œ¥¹‘•Á•¹‘•¹Ð±Á…„Í¹…ÁÍ¡½Ð‰…Ñ¡•Ì½¹ÕÉÉ•¹Ñ±ä¥¹ÍÑ•…½˜Í•É¥…±±ä(€€€€ŒÝ…¥Ñ¥¹œÑ¡É½Õ •Ù•ÉäÍåµ‰½°É½ÕÀ¸(€€€Ý¥Ñ ½¹ÕÉÉ•¹Ð¹™ÕÑÕÉ•Ì¹Q¡É•…‘A½½±á•ÕÑ½È¡µ…á}Ý½É­•ÉÌõµ¥¸ Ø±µ…à Ä±±•¸¡‰…Ñ¡•Ì¤¤¤¤…ÌÁ½½°è(€€€€€€€‰…Ñ¡}É•ÍÕ±ÑÌõ±¥ÍÐ¡é¥À¡‰…Ñ¡•Ì±Á½½°¹µ…À¡Í¹…ÁÍ¡½ÑÍ}™½È±‰…Ñ¡•Ì¤¤¤(€€€™½È‰…Ñ ±Í¹…ÁÍ¡½ÑÌ¥¸‰…Ñ¡}É•ÍÕ±ÑÌè(€€€€€€€™½ÈÍåµ‰½°¥¸‰…Ñ è(€€€€€€€€€€€Í¹…ÀõÍ¹…ÁÍ¡½ÑÌ¹•Ð¡Íåµ‰½°¤í‰…Èõ•Ñ…ÑÑÈ¡Í¹…À°‰‘…¥±å}‰…Èˆ±9½¹”¤íÑÉ…‘”õ•Ñ…ÑÑÈ¡Í¹…À°‰±…Ñ•ÍÑ}ÑÉ…‘”ˆ±9½¹”¤íÅÕ½Ñ”õ•Ñ…ÑÑÈ¡Í¹…À°‰±…Ñ•ÍÑ}ÅÕ½Ñ”ˆ±9½¹”¤íµ¥¹ÕÑ”õ•Ñ…ÑÑÈ¡Í¹…À°‰µ¥¹ÕÑ•}‰…Èˆ±9½¹”¤(€€€€€€€€€€€½Á•¹•õ¹Õµ‰•È¡•Ñ…ÑÑÈ¡‰…È°‰½Á•¸ˆ±9½¹”¤¤(€€€€€€€€€€€€ŒQ¡”•á•ÕÑ…‰±”…Í¬¥ÌÑ¡”½¹Í•ÉÙ…Ñ¥Ù”±¥Ù”‰Õä½‰Í•ÉÙ…Ñ¥½¸¸%`Ì(€€€€€€€€€€€€Œ±…ÍÐÑÉ…‘”…¸‰”½±•Ù•¸Ý¡¥±”¥ÑÌÅÕ½Ñ”¥ÌÕÉÉ•¹Ð°Ý¡¥ µ…‘”„(€€€€€€€€€€€€Œ¡•…±Ñ¡äµ¥‘‘…äÍ…¸™…±Í•±äÉ•Á½ÉÐé•É¼ÅÕ…±¥™¥•ÉÌ¸(€€€€€€€€€€€…Í¬õ¹Õµ‰•È¡•Ñ…ÑÑÈ¡ÅÕ½Ñ”°‰…Í­}ÁÉ¥”ˆ±9½¹”¤¤í‰¥õ¹Õµ‰•È¡•Ñ…ÑÑÈ¡ÅÕ½Ñ”°‰‰¥‘}ÁÉ¥”ˆ±9½¹”¤¤(€€€€€€€€€€€ÕÉÉ•¹Ðõ…Í¬½È€¡¹Õµ‰•È¡•Ñ…ÑÑÈ¡ÑÉ…‘”°‰ÁÉ¥”ˆ±9½¹”¤¤¤½È¹Õµ‰•È¡•Ñ…ÑÑÈ¡µ¥¹ÕÑ”°‰±½Í”ˆ±9½¹”¤¤(€€€€€€€€€€€ÍÑ…µÀô¡•Ñ…ÑÑÈ¡ÅÕ½Ñ”°‰Ñ¥µ•ÍÑ…µÀˆ±9½¹”¤¥˜…Í¬•±Í”9½¹”¤½È•Ñ…ÑÑÈ¡ÑÉ…‘”°‰Ñ¥µ•ÍÑ…µÀˆ±9½¹”¤½È•Ñ…ÑÑÈ¡µ¥¹ÕÑ”°‰Ñ¥µ•ÍÑ…µÀˆ±9½¹”¤(€€€€€€€€€€€¥˜ÍÑ…µÀ¥Ì9½¹”é½¹Ñ¥¹Õ”(€€€€€€€€€€€¥˜ÍÑ…µÀ¹Ñé¥¹™¼¥Ì9½¹”éÍÑ…µÀõÍÑ…µÀ¹É•Á±…”¡Ñé¥¹™¼õÑ¥µ•é½¹”¹ÕÑŒ¤(€€€€€€€€€€€¥˜ÕÑ}¹½ÜµÍÑ…µÀ¹…ÍÑ¥µ•é½¹”¡Ñ¥µ•é½¹”¹ÕÑŒ¤ùÑ¥µ•‘•±Ñ„¡µ¥¹ÕÑ•ÌôÔ¤é½¹Ñ¥¹Õ”(€€€€€€€€€€€¥˜¹½Ð•¹ÑÉå}Í¥¹…±}µ•Ð¡½Á•¹•±ÕÉÉ•¹Ð±Ñ¡É•Í¡½±¤é½¹Ñ¥¹Õ”(€€€€€€€€€€€É½ÜõÉ½ÝÍmÍåµ‰½±tíÉ½Ü¹ÕÁ‘…Ñ”¡ÁÉ¥”õÕÉÉ•¹Ð±Í•ÍÍ¥½¹}½Á•¸õ½Á•¹•±•¹ÑÉå}Í¥¹…±}ÁÐô¡ÕÉÉ•¹Ð½½Á•¹•´Ä¤¨ÄÀÀ±•¹ÑÉå}½¹™¥Éµ•õQÉÕ”±•¹ÑÉå}ÁÉ¥•}Í½ÕÉ”ô ‰…Í¬ˆ¥˜…Í¬•±Í”€‰±…ÍÑ}ÑÉ…‘”ˆ¤¤íÅÕ…±¥™¥•¹…ÁÁ•¹¡É½Ü¤(€€€É•ÑÕÉ¸Í½ÉÑ•¡ÅÕ…±¥™¥•±­•äõ±…µ‰‘„É½Üè¡É½Ü¹•Ð ‰É…¹¬ˆ°ÄÀ¨¨ä¤°µ™±½…Ð¡É½Ü¹•Ð ‰Í½É”ˆ°À¤¤¤¤)‘•˜…±Á……}¡¥ÍÑ½Éä¡Íåµ‰½±Ì¤è(€€€¥µÁ½ÉÐÁ…¹‘…Ì…ÌÁ(€€€™É½´…±Á…„¹‘…Ñ„¹•¹ÕµÌ¥µÁ½ÉÐ…Ñ…••(€€€™É½´…±Á…„¹‘…Ñ„¹¡¥ÍÑ½É¥…°¥µÁ½ÉÐMÑ½­!¥ÍÑ½É¥…±…Ñ…±¥•¹Ð(€€€™É½´…±Á…„¹‘…Ñ„¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐMÑ½­	…ÉÍI•ÅÕ•ÍÐ(€€€™É½´…±Á…„¹‘…Ñ„¹Ñ¥µ•™É…µ”¥µÁ½ÉÐQ¥µ•É…µ”(€€€­•ä±Í•É•ÐõÉ•‘•¹Ñ¥…±Ì ¤í™••‘}¹…µ”õ½Ì¹•Ñ•¹Ø ‰1A}Q}ˆ°‰¥•àˆ¤¹±½Ý•È ¤í™••õ…Ñ…••¹M%@¥˜™••‘}¹…µ”ôô‰Í¥Àˆ•±Í”…Ñ…••¹%`(€€€µ…É­•ÐõMÑ½­!¥ÍÑ½É¥…±…Ñ…±¥•¹Ð¡­•ä±Í•É•Ð¤í±½Í•ÌõmtíÙ½±Õµ•ÌõmtíÍÑ…ÉÐõ‘…Ñ•Ñ¥µ”¹¹½Ü¡Ñ¥µ•é½¹”¹ÕÑŒ¤µÑ¥µ•‘•±Ñ„¡‘…åÌôÔ¨ÌØØ¤(€€€™½È½™™Í•Ð¥¸É…¹” À±±•¸¡Íåµ‰½±Ì¤°ÈÀ¤è(€€€€€€€‰…Ñ õÍåµ‰½±Ím½™™Í•Ðé½™™Í•Ð¬ÈÁtí‰…ÉÌõµ…É­•Ð¹•Ñ}ÍÑ½­}‰…ÉÌ¡MÑ½­	…ÉÍI•ÅÕ•ÍÐ¡Íåµ‰½±}½É}Íåµ‰½±Ìõ‰…Ñ ±ÍÑ…ÉÐõÍÑ…ÉÐ±Ñ¥µ•™É…µ”õQ¥µ•É…µ”¹…ä±™••õ™••¤¤í™É…µ”õ‰…ÉÌ¹‘˜(€€€€€€€¥˜™É…µ”¥Ì9½¹”½È™É…µ”¹•µÁÑäé½¹Ñ¥¹Õ”(€€€€€€€¥˜¥Í¥¹ÍÑ…¹”¡™É…µ”¹¥¹‘•à±Á¹5Õ±Ñ¥%¹‘•à¤è(€€€€€€€€€€€±½Í•Ì¹…ÁÁ•¹¡™É…µ•l‰±½Í”‰t¹Õ¹ÍÑ…¬¡±•Ù•°ô‰Íåµ‰½°ˆ¤¤íÙ½±Õµ•Ì¹…ÁÁ•¹¡™É…µ•l‰Ù½±Õµ”‰t¹Õ¹ÍÑ…¬¡±•Ù•°ô‰Íåµ‰½°ˆ¤¤(€€€¥˜¹½Ð±½Í•ÌéÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰±Á…„µ…É­•Ð¡¥ÍÑ½Éä¥ÌÕ¹…Ù…¥±…‰±”ˆ¤(€€€±½Í”õÁ¹½¹…Ð¡±½Í•Ì±…á¥ÌôÄ¤¹Í½ÉÑ}¥¹‘•à ¤íÙ½±Õµ”õÁ¹½¹…Ð¡Ù½±Õµ•Ì±…á¥ÌôÄ¤¹É•¥¹‘•à¡±½Í”¹¥¹‘•à¤(€€€±½Í”¹½±Õµ¹ÌõmÍÑÈ¡Œ¤¹ÕÁÁ•È ¤™½ÈŒ¥¸±½Í”¹½±Õµ¹ÍtíÙ½±Õµ”¹½±Õµ¹ÌõmÍÑÈ¡Œ¤¹ÕÁÁ•È ¤™½ÈŒ¥¸Ù½±Õµ”¹½±Õµ¹Ít(€€€É•ÑÕÉ¸±½Í”¹±½lè±ù±½Í”¹½±Õµ¹Ì¹‘ÕÁ±¥…Ñ• ¥t±Ù½±Õµ”¹±½lè±ùÙ½±Õµ”¹½±Õµ¹Ì¹‘ÕÁ±¥…Ñ• ¥t)‘•˜½É¡•ÍÑÉ…Ñ•}½Á•¸ ¨±Í•ÍÍ¥½¹}‘…Ñ”±¥‘•µÁ½Ñ•¹å}­•ä±Á…Á•É}½¹±ä¤è(€€€¥˜¹½ÐÁ…Á•É}½¹±ä½È¹½ÐÁ…Á•È ¤éÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰Á…Á•Èµ½¹±ä±…Õ¹ É•ÅÕ¥É•ˆ¤(€€€ÍÑ…Ñ”õ±½…‘}ÍÑ…Ñ” ¤(€€€¥˜¹½ÐÍÑ…Ñ”¹•Ð ‰…Éµ•ˆ±QÉÕ”¤éÉ•ÑÕÉ¸ì‰Í•ÍÍ¥½¹}‘…Ñ”ˆéÍ•ÍÍ¥½¹}‘…Ñ”°‰ÍÑ…ÑÕÌˆè‰‘¥Í…Éµ•ˆ°‰Á…Á•É}½¹±äˆéQÉÕ•ô(€€€¥˜¹½Ð•¹…‰±• ¤éÉ•ÑÕÉ¸ì‰Í•ÍÍ¥½¹}‘…Ñ”ˆéÍ•ÍÍ¥½¹}‘…Ñ”°‰ÍÑ…ÑÕÌˆè‰‰É½­•É}•á•ÕÑ¥½¹}‘¥Í…‰±•ˆ°‰½É‘•ÉÌˆèÀ°‰Á…Á•É}½¹±äˆéQÉÕ•ô(€€€‰É½­•Èõ±¥•¹Ð ¤í…½Õ¹Ðõ…½Õ¹Ñ}‘…Ñ„ ¤í‰Àõ¹Õµ‰•È¡…½Õ¹Ð¹•Ð ‰‰Õå¥¹}Á½Ý•Èˆ¤¤½È€ÀíÉ•ÅÕ•ÍÑ•õ¹Õµ‰•È¡ÍÑ…Ñ”¹•Ð ‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ðˆ¤¤½Èµ¥¸ ÔÀÀÀÀ±‰À¤í…±±½…Ñ¥½¸õµ¥¸¡É•ÅÕ•ÍÑ•±‰À¤(€€€¥˜…±±½…Ñ¥½¸ðôÀéÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰9¼Á…Á•È‰Õå¥¹œÁ½Ý•È¥Ì…Ù…¥±…‰±”ˆ¤(€€€±¥™”õ±¥™•å±•}™½È¡‰É½­•È¤íÕÉÉ•¹Ðõ±¥™”¹É•½¹¥±” ¤(€€€Á•¹‘¥¹}ÍÑ…ÑÕÍ•Ìõì‰¹•Üˆ°‰…•ÁÑ•ˆ°‰Á•¹‘¥¹}¹•Üˆ°‰Á…ÉÑ¥…±±å}™¥±±•ˆ°‰ÍÕ‰µ¥ÑÑ•‰ô(€€€½ÕÁ¥•õÍ•Ð¡ÕÉÉ•¹Ð¹•Ð ‰Á½Í¥Ñ¥½¹Ìˆ±íô¤¥ñí¼¹•Ð ‰Íåµ‰½°ˆ¤™½È¼¥¸ÕÉÉ•¹Ð¹•Ð ‰½É‘•ÉÌˆ±íô¤¹Ù…±Õ•Ì ¤¥˜ÍÑÈ¡¼¹•Ð ‰ÍÑ…ÑÕÌˆ°ˆˆ¤¤¹±½Ý•È ¤¥¸Á•¹‘¥¹}ÍÑ…ÑÕÍ•Íô(€€€±½­•õ±¥ÍÐ¡ÍÑ…Ñ”¹•Ð ‰Í•±•Ñ•‘}Ý…Ñ¡±¥ÍÐˆ¤½Èmt¤(€€€…¹‘¥‘…Ñ•}Á½½°õ±¥ÍÐ¡ÍÑ…Ñ”¹•Ð ‰Í•±•Ñ¥½¹}Õ¹¥Ù•ÉÍ”ˆ¤½Èmt¤(€€€¥˜¹½Ð…¹‘¥‘…Ñ•}Á½½°è(€€€€€€€€Œ5¥É…Ñ”Ñ¡”ÁÉ”µ™Õ±°µÕ¹¥Ù•ÉÍ”ÍÑ…Ñ”Í…™•±ä¸]¥Ñ ¹¼‰É½­•È•áÁ½ÍÕÉ”°(€€€€€€€€Œ‘¥Í…ÉÑ¡”½±ÁÉ”µ…Ñ•€ÔÀÍ¼ÅÕ…±¥™¥•±½Ý•ÈµÉ…¹­•¹…µ•Ì…¸•¹Ñ•È¸(€€€€€€€¥˜¹½Ð½ÕÁ¥•é±½­•õmt(€€€€€€€…¹‘¥‘…Ñ•}Á½½°õmí¬éÉ½Ü¹•Ð¡¬¤™½È¬¥¸€ ‰Ñ¥­•Èˆ°‰É…¹¬ˆ°‰Í½É”ˆ°‰ÁÉ¥”ˆ°‰…Ñ•½Éäˆ°‰•±¥¥‰±”ˆ¥ô™½ÈÉ½Ü¥¸ÑÉ…‘…‰±•}Á¥­Ì¡‰É½­•È°ÔÀ¥t(€€€±¥Ù•}ÅÕ…±¥™¥•õÅÕ…±¥™å¥¹}Õ¹¥Ù•ÉÍ•}Á¥­Ì¡‰É½­•È°ÔÀ±É…¹­•õ…¹‘¥‘…Ñ•}Á½½°¤(€€€€ŒAÉ•Í•ÉÙ”…±É•…‘äÍ•±•Ñ•½½É‘•É•Íåµ‰½±Ì…¹…ÁÁ•¹¹•Ý±äÅÕ…±¥™¥•¹…µ•Ì(€€€€Œ¥¸XÔ¸àÉ…¹¬½É‘•ÈÕ¹Ñ¥°Ñ¡”•ÅÕ…°µÝ•¥¡ÐQ½À€ÔÀ¥Ì™Õ±°¸(€€€‰å}Íåµ‰½°õíÍÑÈ¡É½Ü¹•Ð ‰Ñ¥­•Èˆ¤¤é‘¥Ð¡É½Ü¤™½ÈÉ½Ü¥¸±½­•‘ô(€€€™½ÈÉ½Ü¥¸±¥Ù•}ÅÕ…±¥™¥•è(€€€€€€€Íåµ‰½°õÍÑÈ¡É½Ü¹•Ð ‰Ñ¥­•Èˆ¤¤(€€€€€€€¥˜Íåµ‰½°…¹€¡Íåµ‰½°¥¸‰å}Íåµ‰½°½È±•¸¡‰å}Íåµ‰½°¤ðÔÀ¤é‰å}Íåµ‰½±mÍåµ‰½±tõ‘¥Ð¡É½Ü¤(€€€±½­•õÍ½ÉÑ•¡‰å}Íåµ‰½°¹Ù…±Õ•Ì ¤±­•äõ±…µ‰‘„É½ÜéÉ½Ü¹•Ð ‰É…¹¬ˆ°ÄÀ¨¨ä¤¥lèÔÁt(€€€ÅÕ…±¥™¥•‘}Íåµ‰½±ÌõíÍÑÈ¡É½Ü¹•Ð ‰Ñ¥­•Èˆ¤¤™½ÈÉ½Ü¥¸±¥Ù•}ÅÕ…±¥™¥•‘ô(€€€½¹™¥Éµ•õmÉ½Ü™½ÈÉ½Ü¥¸±½­•¥˜ÍÑÈ¡É½Ü¹•Ð ‰Ñ¥­•Èˆ¤¤¥¸ÅÕ…±¥™¥•‘}Íåµ‰½±Ì…¹ÍÑÈ¡É½Ü¹•Ð ‰Ñ¥­•Èˆ¤¤¹½Ð¥¸½ÕÁ¥•‘t(€€€ÍÑ…Ñ”¹ÕÁ‘…Ñ”¡Í•±•Ñ¥½¹}Õ¹¥Ù•ÉÍ”õ…¹‘¥‘…Ñ•}Á½½°±Í•±•Ñ•‘}Ý…Ñ¡±¥ÍÐõ±½­•±±…ÍÑ}ÅÕ…±¥™¥•‘}½Õ¹Ðõ±•¸¡±¥Ù•}ÅÕ…±¥™¥•¤±±…ÍÑ}Í…¸õ¹½Ü ¤±±…ÍÑ}•ÉÉ½Èõ9½¹”¤íÍ…Ù•}ÍÑ…Ñ”¡ÍÑ…Ñ”¤(€€€Á¥­Ìõ±½­•(€€€¥˜±•¸¡½ÕÁ¥•¤ðÔÀè(€€€€€€€É•ÍÕ±Ðõ±¥™”¹•¹Ñ•É}…Ù…¥±…‰±”¡½¹™¥Éµ•±‰À±Ñ½Ñ…±}‰Õ‘•Ðõ…±±½…Ñ¥½¸¤(€€€€€€€½ÕÁ¥•õÍ•Ð¡É•ÍÕ±Ð¹•Ð ‰Á½Í¥Ñ¥½¹Ìˆ±íô¤¥ñí¼¹•Ð ‰Íåµ‰½°ˆ¤™½È¼¥¸É•ÍÕ±Ð¹•Ð ‰½É‘•ÉÌˆ±íô¤¹Ù…±Õ•Ì ¤¥˜ÍÑÈ¡¼¹•Ð ‰ÍÑ…ÑÕÌˆ°ˆˆ¤¤¹±½Ý•È ¤¥¸Á•¹‘¥¹}ÍÑ…ÑÕÍ•Íô(€€€€€€€ÍÑ…Ñ”¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõQÉÕ”±…Éµ•õQÉÕ”±…±±½…Ñ¥½¸õ…±±½…Ñ¥½¸±É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹ÐõÉ•ÅÕ•ÍÑ•±±…ÍÑ}Í…¸õ¹½Ü ¤±±…ÍÑ}•ÉÉ½Èõ9½¹”¤íÍ…Ù•}ÍÑ…Ñ”¡ÍÑ…Ñ”¤í•¹ÍÕÉ•}•¹¥¹” ¤(€€€€€€€¥˜±•¸¡½ÕÁ¥•¤ðÔÀéÉ…¥Í”I•ÑÉåA•¹‘¥¹œ¡˜‰Õ±°µÕ¹¥Ù•ÉÍ”•¹ÑÉäÍ…¸èí±•¸¡±½­•¥ôÅÕ…±¥™¥•ìí±•¸¡½ÕÁ¥•¥ô¼ÔÀ¡…Ù”Á…Á•ÈÁ½Í¥Ñ¥½¹Ì½ÈÁ•¹‘¥¹œ½É‘•ÉÌˆ¤(€€€•±Í”è(€€€€€€€Í•±•Ñ•õíÁl‰Ñ¥­•È‰t™½ÈÀ¥¸Á¥­ÍlèÔÁuôí‘•…õÍ•Ð¡ÕÉÉ•¹Ð¹•Ð ‰Á½Í¥Ñ¥½¹Ìˆ±íô¤¤µÍ•±•Ñ•íÁÉ¥•ÌõíÁl‰Ñ¥­•È‰téÁl‰ÁÉ¥”‰t™½ÈÀ¥¸Á¥­Íô(€€€€€€€É•ÍÕ±Ðõ±¥™”¹É•‰…±…¹”¡½¹™¥Éµ•±ÁÉ¥•Ì±‰À±‘•…‘}Íåµ‰½±Ìõ‘•…¤(€€€ÍÑ…Ñ”¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõQÉÕ”±…Éµ•õQÉÕ”±…±±½…Ñ¥½¸õ…±±½…Ñ¥½¸±É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹ÐõÉ•ÅÕ•ÍÑ•±±…ÍÑ}Í…¸õ¹½Ü ¤±±…ÍÑ}•ÉÉ½Èõ9½¹”¤íÍ…Ù•}ÍÑ…Ñ”¡ÍÑ…Ñ”¤í•¹ÍÕÉ•}•¹¥¹” ¤(€€€É•ÑÕÉ¸ì‰Í•ÍÍ¥½¹}‘…Ñ”ˆéÍ•ÍÍ¥½¹}‘…Ñ”°‰¥‘•µÁ½Ñ•¹å}­•äˆé¥‘•µÁ½Ñ•¹å}­•ä°‰Í•±•Ñ•ˆèÔÀ°‰•±¥¥‰±•}…¹‘¥‘…Ñ•Ìˆé±•¸¡Á¥­Ì¤°‰½É‘•ÉÌˆé±•¸¡É•ÍÕ±Ð¹•Ð ‰½É‘•ÉÌˆ±íô¤¤°‰…±±½…Ñ¥½¸ˆé…±±½…Ñ¥½¸°‰Á…Á•É}½¹±äˆéQÉÕ•ô)‘•˜‰É½­•É}…±•¹‘…È ¨±ÍÑ…ÉÐ±•¹¤è(€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•Ñ…±•¹‘…ÉI•ÅÕ•ÍÐ(€€€É•ÑÕÉ¸±¥•¹Ð ¤¹•Ñ}…±•¹‘…È¡•Ñ…±•¹‘…ÉI•ÅÕ•ÍÐ¡ÍÑ…ÉÐõ‘…Ñ”¹™É½µ¥Í½™½Éµ…Ð¡ÍÑ…ÉÐ¤±•¹õ‘…Ñ”¹™É½µ¥Í½™½Éµ…Ð¡•¹¤¤¤)‘•˜Í¡•‘Õ±•É}¥¹ÍÑ…¹” ¤éÉ•ÑÕÉ¸5…É­•ÑM¡•‘Õ±•È¡±…µ‰‘„é±¥•¹Ð ¤¹•Ñ}±½¬ ¤±‰É½­•É}…±•¹‘…È±½É¡•ÍÑÉ…Ñ•}½Á•¸±ÍÑ…Ñ•}Á…Ñ õ½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}M!U1I}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÍ¡•‘Õ±•È¹©Í½¸ˆ¤±Á…Á•É}½¹±äõQÉÕ”¤)‘•˜•¹ÍÕÉ•}Í¡•‘Õ±•È ¤è(€€€±½‰…°M!U1I}Q!I(€€€Ý¥Ñ M!U1I}Q!I}1=,è(€€€€€€€¥˜M!U1I}Q!I¥Ì9½¹”½È¹½ÐM!U1I}Q!I¹¥Í}…±¥Ù” ¤è(€€€€€€€€€€€Í¡•‘Õ±•ÈõÍ¡•‘Õ±•É}¥¹ÍÑ…¹” ¤íM!U1I}Q!IõÑ¡É•…‘¥¹œ¹Q¡É•…¡Ñ…É•ÐõÍ¡•‘Õ±•È¹ÉÕ¹}™½É•Ù•È±…ÉÌô¡IU9Q%5}MQ=@°¤±­Ý…ÉÌõì‰Á½±±}Í•½¹‘ÌˆèÄÕô±¹…µ”ô‰µ½ÍÅÕ¥Ñ¼µµ…É­•ÐµÍ¡•‘Õ±•Èˆ±‘…•µ½¸õQÉÕ”¤íM!U1I}Q!I¹ÍÑ…ÉÐ ¤)‘•˜É•Í•Ñ}Á…Ñ¡Ì ¤è(€€€É•ÑÕÉ¸mMQQ}AQ ±•¹¥¹”¹AQ ±A…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}1%e1}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µ±¥™•å±”¹©Í½¸ˆ¤¤±A…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}M!U1I}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÍ¡•‘Õ±•È¹©Í½¸ˆ¤¤±A…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}M%5}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÍ¥µÕ±…Ñ¥½¸¹©Í½¸ˆ¤¥t)‘•˜É•Í•Ñ}µ…É­•È ¤éÉ•ÑÕÉ¸A…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}IMQ}5I-Hˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÉ•Í•Ðµµ…É­•È¹©Í½¸ˆ¤¤)‘•˜É•Í•Ñ}ÍÑ…ÑÕÌ ¤è(€€€ÑÉäéÉ•ÑÕÉ¸©Í½¸¹±½…‘Ì¡A…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}IMQ}MQQULˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÉ•Í•ÐµÍÑ…ÑÕÌ¹©Í½¸ˆ¤¤¹É•…‘}Ñ•áÐ ¤¤(€€€•á•ÁÐ€¡=MÉÉ½È±Y…±Õ•ÉÉ½È¤éÉ•ÑÕÉ¸ì‰ÍÑ…ÑÕÌˆè‰¹½Ñ}É•ÅÕ•ÍÑ•‰ô)‘•˜ÝÉ¥Ñ•}É•Í•Ñ}ÍÑ…ÑÕÌ¡Ù…±Õ”¤è(€€€Á…Ñ õA…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}IMQ}MQQULˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÉ•Í•ÐµÍÑ…ÑÕÌ¹©Í½¸ˆ¤¤íÁ…Ñ ¹Á…É•¹Ð¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”±•á¥ÍÑ}½¬õQÉÕ”¤íÁ…Ñ ¹ÝÉ¥Ñ•}Ñ•áÐ¡©Í½¸¹‘ÕµÁÌ¡Ù…±Õ”±Í•Á…É…Ñ½ÉÌô ˆ°ˆ°ˆèˆ¤¤¤)‘•˜É•Í•Ñ}‘½¹”¡É•Í•Ñ}¥¤è(€€€ÑÉäéÉ•ÑÕÉ¸©Í½¸¹±½…‘Ì¡É•Í•Ñ}µ…É­•È ¤¹É•…‘}Ñ•áÐ ¤¤¹•Ð ‰É•Í•Ñ}¥ˆ¤ôõÉ•Í•Ñ}¥(€€€•á•ÁÐ€¡=MÉÉ½È±Y…±Õ•ÉÉ½È¤éÉ•ÑÕÉ¸…±Í”)‘•˜ÉÕ¹}Á…Á•É}É•Í•Ð¡É•Í•Ñ}¥¤è(€€€ÑÉäè(€€€€€€€¥˜¹½ÐÁ…Á•È ¤éÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰Á…Á•Èµ½¹±äÉ•Í•ÐÉ•ÅÕ¥É•ˆ¤(€€€€€€€ÝÉ¥Ñ•}É•Í•Ñ}ÍÑ…ÑÕÌ¡ì‰ÍÑ…ÑÕÌˆè‰±½Í¥¹}½±‘}Á…Á•É}Í•ÍÍ¥½¸ˆ°‰É•Í•Ñ}¥ˆéÉ•Í•Ñ}¥°‰ÍÑ…ÉÑ•‘}…Ðˆé¹½Ü ¥ô¤(€€€€€€€‰É½­•Èõ±¥•¹Ð ¤í‰É½­•È¹±½Í•}…±±}Á½Í¥Ñ¥½¹Ì¡…¹•±}½É‘•ÉÌõQÉÕ”¤(€€€€€€€‘•…‘±¥¹”õÑ¥µ”¹µ½¹½Ñ½¹¥Œ ¤¬ÄÈÀ(€€€€€€€Ý¡¥±”Ñ¥µ”¹µ½¹½Ñ½¹¥Œ ¤ñ‘•…‘±¥¹”è(€€€€€€€€€€€¥˜¹½Ð‰É½­•È¹•Ñ}…±±}Á½Í¥Ñ¥½¹Ì ¤é‰É•…¬(€€€€€€€€€€€Ñ¥µ”¹Í±••À È¤(€€€€€€€É•µ…¥¹¥¹œõ‰É½­•È¹•Ñ}…±±}Á½Í¥Ñ¥½¹Ì ¤(€€€€€€€¥˜É•µ…¥¹¥¹œéÉ…¥Í”IÕ¹Ñ¥µ•ÉÉ½È¡˜‰Á…Á•ÈÁ½Í¥Ñ¥½¹ÌÍÑ¥±°½Á•¸èí±•¸¡É•µ…¥¹¥¹œ¥ôˆ¤(€€€€€€€™½ÈÁ…Ñ ¥¸É•Í•Ñ}Á…Ñ¡Ì ¤è(€€€€€€€€€€€ÑÉäéÁ…Ñ ¹Õ¹±¥¹¬ ¤(€€€€€€€€€€€•á•ÁÐ¥±•9½Ñ½Õ¹‘ÉÉ½ÈéÁ…ÍÌ(€€€€€€€…½Õ¹Ðõ‰É½­•È¹•Ñ}…½Õ¹Ð ¤í‰…Í•±¥¹”õ¹Õµ‰•È¡•Ñ…ÑÑÈ¡…½Õ¹Ð°‰•ÅÕ¥Ñäˆ±9½¹”¤¤(€€€€€€€ÍÑ…Ñ”õì¨©U1QL°‰…±±½…Ñ¥½¸ˆèÔÀÀÀÀ¸À°‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹ÐˆèÔÀÀÀÀ¸À°‰‰…Í•±¥¹•}•ÅÕ¥Ñäˆé‰…Í•±¥¹”°‰ÉÕ¹¹¥¹œˆéQÉÕ”°‰…Éµ•ˆéQÉÕ”°‰±…ÍÑ}•ÉÉ½Èˆé9½¹•ôíÍ…Ù•}ÍÑ…Ñ”¡ÍÑ…Ñ”¤(€€€€€€€µ…É­•ÈõÉ•Í•Ñ}µ…É­•È ¤íµ…É­•È¹Á…É•¹Ð¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”±•á¥ÍÑ}½¬õQÉÕ”¤íµ…É­•È¹ÝÉ¥Ñ•}Ñ•áÐ¡©Í½¸¹‘ÕµÁÌ¡ì‰É•Í•Ñ}¥ˆéÉ•Í•Ñ}¥°‰½µÁ±•Ñ•‘}…Ðˆé¹½Ü ¥ô±Í•Á…É…Ñ½ÉÌô ˆ°ˆ°ˆèˆ¤¤¤(€€€€€€€ÝÉ¥Ñ•}É•Í•Ñ}ÍÑ…ÑÕÌ¡ì‰ÍÑ…ÑÕÌˆè‰½µÁ±•Ñ”ˆ°‰É•Í•Ñ}¥ˆéÉ•Í•Ñ}¥°‰…±±½…Ñ¥½¸ˆèÔÀÀÀÀ¸À°‰½±‘}Á½Í¥Ñ¥½¹Í}É•µ…¥¹¥¹œˆèÀ°‰½µÁ±•Ñ•‘}…Ðˆé¹½Ü ¥ô¤(€€€€€€€Ý¥Ñ 1=,é!¹±•…È ¤(€€€€€€€•¹ÍÕÉ•}•¹¥¹” ¤í•¹ÍÕÉ•}Í¡•‘Õ±•È ¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€ÝÉ¥Ñ•}É•Í•Ñ}ÍÑ…ÑÕÌ¡ì‰ÍÑ…ÑÕÌˆè‰™…¥±•ˆ°‰É•Í•Ñ}¥ˆéÉ•Í•Ñ}¥°‰•ÉÉ½É}ÑåÁ”ˆéÑåÁ”¡•áŒ¤¹}}¹…µ•}|°‰™…¥±•‘}…Ðˆé¹½Ü ¥ô¤(€€€€€€€…ÁÀ¹±½•È¹•ÉÉ½È ‰Á…Á•ÈÉ•Í•Ð™…¥±•è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤)‘•˜•¹ÍÕÉ•}É•Í•Ð ¤è(€€€±½‰…°IMQ}Q!I(€€€É•Í•Ñ}¥õÍÑÈ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}IMQ}%ˆ°ˆˆ¤¤¹ÍÑÉ¥À ¤(€€€¥˜¹½ÐÉ•Í•Ñ}¥½ÈÉ•Í•Ñ}‘½¹”¡É•Í•Ñ}¥¤éÉ•ÑÕÉ¸QÉÕ”(€€€Ý¥Ñ IMQ}Q!I}1=,è(€€€€€€€¥˜IMQ}Q!I¥Ì9½¹”½È¹½ÐIMQ}Q!I¹¥Í}…±¥Ù” ¤è(€€€€€€€€€€€IMQ}Q!IõÑ¡É•…‘¥¹œ¹Q¡É•…¡Ñ…É•ÐõÉÕ¹}Á…Á•É}É•Í•Ð±…ÉÌô¡É•Í•Ñ}¥°¤±¹…µ”ô‰µ½ÍÅÕ¥Ñ¼µÁ…Á•ÈµÉ•Í•Ðˆ±‘…•µ½¸õQÉÕ”¤íIMQ}Q!I¹ÍÑ…ÉÐ ¤(€€€É•ÑÕÉ¸…±Í”)‘•˜•¹ÍÕÉ•}ÉÕ¹Ñ¥µ” ¤è(€€€¥˜ÑÉÕÑ¡ä ‰5=MEU%Q=}IU9Q%5}9	1ˆ¤½È‰½½°¡½Ì¹•Ñ•¹Ø ‰I%1]e}9Y%I=959Pˆ¤¤è(€€€€€€€¥˜•¹ÍÕÉ•}É•Í•Ð ¤é•¹ÍÕÉ•}•¹¥¹” ¤í•¹ÍÕÉ•}Í¡•‘Õ±•È ¤)‘•˜Í•É¥…°¡Ø¤è(€€€¥˜Ø¥Ì9½¹”½È¥Í¥¹ÍÑ…¹”¡Ø°¡ÍÑÈ±‰½½°±¥¹Ð±™±½…Ð¤¤èÉ•ÑÕÉ¸Ø(€€€¥˜¥Í¥¹ÍÑ…¹”¡Ø±‘…Ñ•Ñ¥µ”¤èÉ•ÑÕÉ¸Ø¹¥Í½™½Éµ…Ð ¤(€€€¥˜¥Í¥¹ÍÑ…¹”¡Ø°¡±¥ÍÐ±ÑÕÁ±”¤¤èÉ•ÑÕÉ¸mÍ•É¥…°¡à¤™½Èà¥¸Ùt(€€€¥˜¥Í¥¹ÍÑ…¹”¡Ø±‘¥Ð¤èÉ•ÑÕÉ¸íÍÑÈ¡¬¤éÍ•É¥…°¡à¤™½È¬±à¥¸Ø¹¥Ñ•µÌ ¥ô(€€€¥˜¡…Í…ÑÑÈ¡Ø°‰µ½‘•±}‘ÕµÀˆ¤èÉ•ÑÕÉ¸Í•É¥…°¡Ø¹µ½‘•±}‘ÕµÀ¡µ½‘”ô‰©Í½¸ˆ¤¤(€€€¥˜¡…Í…ÑÑÈ¡Ø°‰‘¥Ðˆ¤èÉ•ÑÕÉ¸Í•É¥…°¡Ø¹‘¥Ð ¤¤(€€€É•ÑÕÉ¸ÍÑÈ¡Ø¤)‘•˜¹Õµ‰•È¡Ø¤è(€€€ÑÉäè¸õ™±½…Ð¡Ø¤ìÉ•ÑÕÉ¸¸¥˜µ…Ñ ¹¥Í™¥¹¥Ñ”¡¸¤•±Í”9½¹”(€€€•á•ÁÐ€¡QåÁ•ÉÉ½È±Y…±Õ•ÉÉ½È¤èÉ•ÑÕÉ¸9½¹”)‘•˜±½…‘}ÍÑ…Ñ” ¤è(€€€Ý¥Ñ 1=,è(€€€€€€€ÑÉäè(€€€€€€€€€€€É…Üõ©Í½¸¹±½…‘Ì¡MQQ}AQ ¹É•…‘}Ñ•áÐ ¤¤(€€€€€€€€€€€¥˜¹½Ð¥Í¥¹ÍÑ…¹”¡É…Ü±‘¥Ð¤èÉ…Üõíô(€€€€€€€•á•ÁÐ€¡=MÉÉ½È±Y…±Õ•ÉÉ½È¤èÉ…Üõíô(€€€€€€€ÍÑ…Ñ”õì¨©U1QL°¨©í¬éÉ…Ým­t™½È¬¥¸U1QL¥˜¬¥¸É…Ýõô(€€€€€€€€ŒMÑ…Ñ•ÌÝÉ¥ÑÑ•¸‰•™½É”É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ð•á¥ÍÑ•ÕÍ•…±±½…Ñ¥½¸™½È(€€€€€€€€Œ‰½Ñ Ñ¡”½Ý¹•ÈÌÉ•ÅÕ•ÍÐ…¹Ñ¡”‰Õå¥¹œµÁ½Ý•Èµ…ÁÁ•…±±½…Ñ¥½¸¸(€€€€€€€¥˜€‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ðˆ¹½Ð¥¸É…ÜéÍÑ…Ñ•l‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ð‰tõÍÑ…Ñ•l‰…±±½…Ñ¥½¸‰t(€€€€€€€É•ÑÕÉ¸ÍÑ…Ñ”)‘•˜Í…Ù•}ÍÑ…Ñ”¡ÍÑ…Ñ”¤è(€€€ÍÑ…Ñ”õì¨©U1QL°¨©í¬éÍÑ…Ñ•m­t™½È¬¥¸U1QL¥˜¬¥¸ÍÑ…Ñ•ô°‰ÕÁ‘…Ñ•‘}…Ðˆé¹½Ü ¥ô(€€€Ý¥Ñ 1=,è(€€€€€€€MQQ}AQ ¹Á…É•¹Ð¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”±•á¥ÍÑ}½¬õQÉÕ”¤(€€€€€€€™±¹…µ”õÑ•µÁ™¥±”¹µ­ÍÑ•µÀ¡ÁÉ•™¥àôˆ¹µ½ÍÅÕ¥Ñ¼´ˆ±‘¥ÈõÍÑÈ¡MQQ}AQ ¹Á…É•¹Ð¤¤(€€€€€€€ÑÉäè(€€€€€€€€€€€Ý¥Ñ ½Ì¹™‘½Á•¸¡™°‰Üˆ¤…Ì˜è©Í½¸¹‘ÕµÀ¡ÍÑ…Ñ”±˜±Í•Á…É…Ñ½ÉÌô ˆ°ˆ°ˆèˆ¤¤(€€€€€€€€€€€½Ì¹É•Á±…”¡¹…µ”±MQQ}AQ ¤(€€€€€€€™¥¹…±±äè(€€€€€€€€€€€ÑÉäè½Ì¹Õ¹±¥¹¬¡¹…µ”¤(€€€€€€€€€€€•á•ÁÐ¥±•9½Ñ½Õ¹‘ÉÉ½ÈèÁ…ÍÌ)‘•˜…¡•¡­•ä±ÑÑ°±±½…‘•È¤è(€€€ÐõÑ¥µ”¹µ½¹½Ñ½¹¥Œ ¤(€€€Ý¥Ñ 1=,è(€€€€€€€¡¥Ðõ!¹•Ð¡­•ä¤(€€€€€€€¥˜¡¥Ð…¹¡¥ÑlÁtùÐéÉ•ÑÕÉ¸¡¥ÑlÅt(€€€Ù…±Õ”õ±½…‘•È ¤(€€€Ý¥Ñ 1=,é!m­•åtô¡Ð­ÑÑ°±Ù…±Õ”¤(€€€É•ÑÕÉ¸Ù…±Õ”)‘•˜•ÉÉ½È¡µ•ÍÍ…”±ÍÑ…ÑÕÌôÐÀÀ¤èÉ•ÑÕÉ¸©Í½¹¥™ä¡•ÉÉ½Èõµ•ÍÍ…”±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤±ÍÑ…ÑÕÌ)‘•˜ÕÁÍÑÉ•…´¡•áŒ±½Á•É…Ñ¥½¸ô‰‰É½­•É}É•ÅÕ•ÍÐˆ±•¹‘Á½¥¹Ðõ9½¹”¤é±½}‰É½­•É}•ÉÉ½È¡•áŒ±½Á•É…Ñ¥½¸±•¹‘Á½¥¹Ð¤íÉ•ÑÕÉ¸•ÉÉ½È ‰	É½­•ÈÍ•ÉÙ¥”¥ÌÑ•µÁ½É…É¥±äÕ¹…Ù…¥±…‰±”ˆ°ÔÀÌ¤)‘•˜…ÕÑ¡½É¥é• ¤è(€€€•áÁ•Ñ•õ½Ì¹•Ñ•¹Ø ‰M!	=I}Q=-8ˆ¤(€€€¥˜¹½Ð•áÁ•Ñ•éÉ•ÑÕÉ¸QÉÕ”(€€€…ÕÑ õÉ•ÅÕ•ÍÐ¹¡•…‘•ÉÌ¹•Ð ‰ÕÑ¡½É¥é…Ñ¥½¸ˆ°ˆˆ¤ìÍÕÁÁ±¥•õ…ÕÑ¡lÜét¹ÍÑÉ¥À ¤¥˜…ÕÑ ¹±½Ý•È ¤¹ÍÑ…ÉÑÍÝ¥Ñ  ‰‰•…É•È€ˆ¤•±Í”9½¹”(€€€ÍÕÁÁ±¥•õÍÕÁÁ±¥•½ÈÉ•ÅÕ•ÍÐ¹¡•…‘•ÉÌ¹•Ð ‰`µ…Í¡‰½…ÉµQ½­•¸ˆ¤½ÈÉ•ÅÕ•ÍÐ¹…ÉÌ¹•Ð ‰Ñ½­•¸ˆ¤½ÈÉ•ÅÕ•ÍÐ¹½½­¥•Ì¹•Ð ‰µ½ÍÅÕ¥Ñ½}…•ÍÌˆ¤(€€€É•ÑÕÉ¸‰½½°¡ÍÕÁÁ±¥•¤…¹¡µ…Œ¹½µÁ…É•}‘¥•ÍÐ¡ÍÕÁÁ±¥•±•áÁ•Ñ•¤)…ÁÀ¹‰•™½É•}É•ÅÕ•ÍÐ)‘•˜ÁÉ½Ñ•Ð ¤è(€€€•¹ÍÕÉ•}ÉÕ¹Ñ¥µ” ¤(€€€¥˜É•ÅÕ•ÍÐ¹Á…Ñ ¹ÍÑ…ÉÑÍÝ¥Ñ  ˆ½…Á¤¼ˆ¤…¹¹½Ð…ÕÑ¡½É¥é• ¤éÉ•ÑÕÉ¸•ÉÉ½È ‰U¹…ÕÑ¡½É¥é•ˆ°ÐÀÄ¤)…ÁÀ¹…™Ñ•É}É•ÅÕ•ÍÐ)‘•˜¡•…‘•ÉÌ¡É•ÍÁ½¹Í”¤è(€€€™½È¬±Ø¥¸ì‰`µ½¹Ñ•¹ÐµQåÁ”µ=ÁÑ¥½¹Ìˆè‰¹½Í¹¥™˜ˆ°‰`µÉ…µ”µ=ÁÑ¥½¹Ìˆè‰9dˆ°‰I•™•ÉÉ•ÈµA½±¥äˆè‰¹¼µÉ•™•ÉÉ•Èˆ°‰A•Éµ¥ÍÍ¥½¹ÌµA½±¥äˆè‰…µ•É„ô ¤°µ¥É½Á¡½¹”ô ¤°•½±½…Ñ¥½¸ô ¤ˆ°‰½¹Ñ•¹ÐµM•ÕÉ¥ÑäµA½±¥äˆè‰‘•™…Õ±ÐµÍÉŒ€Í•±˜œì¥µœµÍÉŒ€Í•±˜œ‘…Ñ„èìÍÑå±”µÍÉŒ€Í•±˜œ€Õ¹Í…™”µ¥¹±¥¹”œìÍÉ¥ÁÐµÍÉŒ€Í•±˜œ€Õ¹Í…™”µ¥¹±¥¹”œì½¹¹•ÐµÍÉŒ€Í•±˜œ‰ô¹¥Ñ•µÌ ¤éÉ•ÍÁ½¹Í”¹¡•…‘•ÉÍm­tõØ(€€€¥˜É•ÅÕ•ÍÐ¹Á…Ñ ¹ÍÑ…ÉÑÍÝ¥Ñ  ˆ½…Á¤¼ˆ¤éÉ•ÍÁ½¹Í”¹¡•…‘•ÉÍl‰…¡”µ½¹ÑÉ½°‰tô‰¹¼µÍÑ½É”ˆ(€€€Ñ½­•¸õÉ•ÅÕ•ÍÐ¹…ÉÌ¹•Ð ‰Ñ½­•¸ˆ¤í•áÁ•Ñ•õ½Ì¹•Ñ•¹Ø ‰M!	=I}Q=-8ˆ¤(€€€¥˜Ñ½­•¸…¹•áÁ•Ñ•…¹¡µ…Œ¹½µÁ…É•}‘¥•ÍÐ¡Ñ½­•¸±•áÁ•Ñ•¤éÉ•ÍÁ½¹Í”¹Í•Ñ}½½­¥” ‰µ½ÍÅÕ¥Ñ½}…•ÍÌˆ±Ñ½­•¸±¡ÑÑÁ½¹±äõQÉÕ”±Í•ÕÉ”õÉ•ÅÕ•ÍÐ¹¥Í}Í•ÕÉ”±Í…µ•Í¥Ñ”ô‰MÑÉ¥Ðˆ±µ…á}…”ôÈÔäÈÀÀÀ¤(€€€É•ÑÕÉ¸É•ÍÁ½¹Í”)‘•˜É…Ñ•}±¥µ¥Ð¡±¥µ¥ÐôÈÀ±Ý¥¹‘½ÜôØÀ¤è(€€€‘•˜‘•¼¡™¸¤è(€€€€€€€ÝÉ…ÁÌ¡™¸¤(€€€€€€€‘•˜ÝÉ…À ©„°¨©­Ü¤è(€€€€€€€€€€€¥‘•¹Ðõ˜‰íÉ•ÅÕ•ÍÐ¹É•µ½Ñ•}…‘‘ÉôéíÉ•ÅÕ•ÍÐ¹Á…Ñ¡ôˆíÐõÑ¥µ”¹µ½¹½Ñ½¹¥Œ ¤(€€€€€€€€€€€Ý¥Ñ 1=,è(€€€€€€€€€€€€€€€Äõ11Mm¥‘•¹Ñt(€€€€€€€€€€€€€€€Ý¡¥±”Ä…¹ÅlÁtðõÐµÝ¥¹‘½ÜéÄ¹Á½Á±•™Ð ¤(€€€€€€€€€€€€€€€¥˜±•¸¡Ä¤øõ±¥µ¥ÐéÉ•ÑÕÉ¸•ÉÉ½È ‰Q½¼µ…¹äÉ•ÅÕ•ÍÑÌìÑÉä……¥¸Í¡½ÉÑ±äˆ°ÐÈä¤(€€€€€€€€€€€€€€€Ä¹…ÁÁ•¹¡Ð¤(€€€€€€€€€€€É•ÑÕÉ¸™¸ ©„°¨©­Ü¤(€€€€€€€É•ÑÕÉ¸ÝÉ…À(€€€É•ÑÕÉ¸‘•¼)…ÁÀ¹•Ð ˆ¼ˆ¤)‘•˜É½½Ð ¤è(€€€¥˜½Ì¹•Ñ•¹Ø ‰M!	=I}Q=-8ˆ¤…¹¹½Ð…ÕÑ¡½É¥é• ¤èÉ•ÑÕÉ¸É•‘¥É•Ð ˆ½±½¥¸ˆ¤(€€€É•ÑÕÉ¸µ…­•}É•ÍÁ½¹Í”¡Í•¹‘}™É½µ}‘¥É•Ñ½Éä¡A…Ñ ¡…ÁÀ¹É½½Ñ}Á…Ñ ¤¼‰Ñ•µÁ±…Ñ•Ìˆ°‰¥¹‘•à¹¡Ñµ°ˆ¤¤)…ÁÀ¹É½ÕÑ” ˆ½±½¥¸ˆ±µ•Ñ¡½‘Ìõl‰Pˆ°‰A=MP‰t¤)‘•˜±½¥¸ ¤è(€€€¥˜¹½Ð½Ì¹•Ñ•¹Ø ‰M!	=I}Q=-8ˆ¤èÉ•ÑÕÉ¸É•‘¥É•Ð ˆ¼ˆ¤(€€€¥˜É•ÅÕ•ÍÐ¹µ•Ñ¡½ôô‰A=MPˆè(€€€€€€€Ñ½­•¸õÉ•ÅÕ•ÍÐ¹™½É´¹•Ð ‰Ñ½­•¸ˆ°ˆˆ¤(€€€€€€€¥˜¡µ…Œ¹½µÁ…É•}‘¥•ÍÐ¡Ñ½­•¸±½Ì¹•Ñ•¹Ø ‰M!	=I}Q=-8ˆ°ˆˆ¤¤è(€€€€€€€€€€€É•ÍÁ½¹Í”õµ…­•}É•ÍÁ½¹Í”¡É•‘¥É•Ð ˆ¼ˆ¤¤íÉ•ÍÁ½¹Í”¹Í•Ñ}½½­¥” ‰µ½ÍÅÕ¥Ñ½}…•ÍÌˆ±Ñ½­•¸±¡ÑÑÁ½¹±äõQÉÕ”±Í•ÕÉ”õÉ•ÅÕ•ÍÐ¹¥Í}Í•ÕÉ”±Í…µ•Í¥Ñ”ô‰MÑÉ¥Ðˆ±µ…á}…”ôÈÔäÈÀÀÀ¤íÉ•ÑÕÉ¸É•ÍÁ½¹Í”(€€€É•ÑÕÉ¸€ˆˆˆð…‘½ÑåÁ”¡Ñµ°øñµ•Ñ„¹…µ”õÙ¥•ÝÁ½ÉÐ½¹Ñ•¹ÐôÝ¥‘Ñ õ‘•Ù¥”µÝ¥‘Ñ œøñÑ¥Ñ±”ù5½ÍÅÕ¥Ñ¼1½¥¸ð½Ñ¥Ñ±”øñÍÑå±”ù‰½‘åí‰…­É½Õ¹èŒÀÔÀÜÀÔí½±½Èè™™˜í™½¹ÐèÄáÁàÍåÍÑ•´µÕ¤í‘¥ÍÁ±…äéÉ¥íÁ±…”µ¥Ñ•µÌé•¹Ñ•Èí¡•¥¡ÐèÄÀÁÙ íµ…É¥¸èÁõ™½ÉµíÝ¥‘Ñ éµ¥¸ àÕÙÜ°ÌàÁÁà¤íÁ…‘‘¥¹œèÌÁÁàí‰½É‘•ÈèÅÁàÍ½±¥€ŒÌÔÐÔÉ„í‰½É‘•ÈµÉ…‘¥ÕÌèÄáÁàí‰…­É½Õ¹èŒÁŒÄÀÁ‰õ¥¹ÁÕÐ±‰ÕÑÑ½¹í‰½àµÍ¥é¥¹œé‰½É‘•Èµ‰½àíÝ¥‘Ñ èÄÀÀ”íÁ…‘‘¥¹œèÄÕÁàíµ…É¥¸µÑ½ÀèÄÕÁàí‰½É‘•ÈµÉ…‘¥ÕÌèÄÁÁáõ‰ÕÑÑ½¹í‰…­É½Õ¹èŒÜÙ•Áˆí™½¹ÐµÝ•¥¡ÐèàÀÁôð½ÍÑå±”øñ™½É´µ•Ñ¡½õÁ½ÍÐøñ Äù5=MEU%Q<ð½ Äøñ±…‰•°ù=Ý¹•È…•ÍÌÑ½­•¸ñ¥¹ÁÕÐ¹…µ”õÑ½­•¸ÑåÁ”õÁ…ÍÍÝ½ÉÉ•ÅÕ¥É•…ÕÑ½™½ÕÌøð½±…‰•°øñ‰ÕÑÑ½¸ù=A8M!	=Ið½‰ÕÑÑ½¸øð½™½É´øˆˆˆ° ÐÀÄ¥˜É•ÅÕ•ÍÐ¹µ•Ñ¡½ôô‰A=MPˆ•±Í”€ÈÀÀ¤)…ÁÀ¹•Ð ˆ½½Ý¹•Èµ±¥¹¬¼ñ¹½¹”øˆ¤)É…Ñ•}±¥µ¥Ð Ô°ÌÀÀ¤)‘•˜½Ý¹•É}±¥¹¬¡¹½¹”¤è(€€€€ˆˆ‰½¹ÍÕµ”„½¹”µÕÍ”‰½½ÑÍÑÉ…À±¥¹¬…¹•ÍÑ…‰±¥Í Ñ¡”ÁÉ¥Ù…Ñ”½Ý¹•È½½­¥”¸ˆˆˆ(€€€•áÁ•Ñ•‘}¡…Í õ½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}5%}1%9-}!M ˆ°ˆˆ¤¹ÍÑÉ¥À ¤¹±½Ý•È ¤(€€€‘…Í¡‰½…É‘}Ñ½­•¸õ½Ì¹•Ñ•¹Ø ‰M!	=I}Q=-8ˆ°ˆˆ¤(€€€ÍÕÁÁ±¥•‘}¡…Í õ¡…Í¡±¥ˆ¹Í¡„ÈÔØ¡¹½¹”¹•¹½‘” ‰ÕÑ˜´àˆ¤¤¹¡•á‘¥•ÍÐ ¤(€€€¥˜¹½Ð•áÁ•Ñ•‘}¡…Í ½È¹½Ð‘…Í¡‰½…É‘}Ñ½­•¸½È¹½Ð¡µ…Œ¹½µÁ…É•}‘¥•ÍÐ¡ÍÕÁÁ±¥•‘}¡…Í ±•áÁ•Ñ•‘}¡…Í ¤è(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰=Ý¹•È±¥¹¬¥Ì¥¹Ù…±¥ˆ°ÐÀÌ¤(€€€µ…É­•ÈõA…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}5%}1%9-}5I-Hˆ±˜ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µµ…¥Œµí•áÁ•Ñ•‘}¡…Í¡lèÄÙuô¹ÕÍ•ˆ¤¤(€€€µ…É­•È¹Á…É•¹Ð¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”±•á¥ÍÑ}½¬õQÉÕ”¤(€€€ÑÉäè(€€€€€€€™õ½Ì¹½Á•¸¡µ…É­•È±½Ì¹=}IQñ½Ì¹=}a1ñ½Ì¹=}]I=91d°Á¼ØÀÀ¤(€€€€€€€Ý¥Ñ ½Ì¹™‘½Á•¸¡™°‰Üˆ¤…Ì¡…¹‘±”é¡…¹‘±”¹ÝÉ¥Ñ”¡¹½Ü ¤¤(€€€•á•ÁÐ¥±•á¥ÍÑÍÉÉ½Èè(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰=Ý¹•È±¥¹¬¡…Ì…±É•…‘ä‰••¸ÕÍ•ˆ°ÐÄÀ¤(€€€É•ÍÁ½¹Í”õµ…­•}É•ÍÁ½¹Í”¡É•‘¥É•Ð ˆ¼ˆ¤¤(€€€É•ÍÁ½¹Í”¹Í•Ñ}½½­¥” ‰µ½ÍÅÕ¥Ñ½}…•ÍÌˆ±‘…Í¡‰½…É‘}Ñ½­•¸±¡ÑÑÁ½¹±äõQÉÕ”±Í•ÕÉ”õÉ•ÅÕ•ÍÐ¹¥Í}Í•ÕÉ”±Í…µ•Í¥Ñ”ô‰MÑÉ¥Ðˆ±µ…á}…”ôÈÔäÈÀÀÀ¤(€€€É•ÍÁ½¹Í”¹¡•…‘•ÉÍl‰…¡”µ½¹ÑÉ½°‰tô‰¹¼µÍÑ½É”ˆ(€€€É•ÑÕÉ¸É•ÍÁ½¹Í”)…ÁÀ¹•Ð ˆ¼ñÁ…Ñ é¹…µ”øˆ¤)‘•˜…ÍÍ•ÑÌ¡¹…µ”¤è(€€€¥˜¹½Ð¹…µ”¹ÍÑ…ÉÑÍÝ¥Ñ  ‰ÍÑ…Ñ¥Œ¼ˆ¤éÉ•ÑÕÉ¸•ÉÉ½È ‰9½Ð™½Õ¹ˆ°ÐÀÐ¤(€€€…ÍÍ•Ðõ¹…µ”¹É•µ½Ù•ÁÉ•™¥à ‰ÍÑ…Ñ¥Œ¼ˆ¤(€€€¥˜…ÍÍ•Ð¹½Ð¥¸ì‰ÍÑå±”¹ÍÌˆ°‰…ÁÀ¹©Ìˆ°‰µ½ÍÅÕ¥Ñ¼µ¡•É¼¹Ý•‰Àˆ°‰µ½ÍÅÕ¥Ñ¼µ¡•É¼µÁÉ½™¥Ð¹Ý•‰À‰ôéÉ•ÑÕÉ¸•ÉÉ½È ‰9½Ð™½Õ¹ˆ°ÐÀÐ¤(€€€É•ÑÕÉ¸Í•¹‘}™É½µ}‘¥É•Ñ½Éä¡A…Ñ ¡…ÁÀ¹É½½Ñ}Á…Ñ ¤¼‰ÍÑ…Ñ¥Œˆ±…ÍÍ•Ð¤)…ÁÀ¹•Ð ˆ½¡•…±Ñ ˆ¤)‘•˜¡•…±Ñ  ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡ÍÑ…ÑÕÌô‰½¬ˆ±Í•ÉÙ¥”ô‰µ½ÍÅÕ¥Ñ¼µÉÕ¹¹•Èˆ±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤)…ÁÀ¹•Ð ˆ½É•…‘äˆ¤)‘•˜É•…‘ä ¤è(€€€¬±ÌõÉ•‘•¹Ñ¥…±Ì ¤íÉ•ÑÕÉ¸©Í½¹¥™ä¡ÍÑ…ÑÕÌô‰É•…‘äˆ±…±Á……}½¹™¥ÕÉ•õ‰½½°¡¬…¹Ì¤±ÍÑ…Ñ•}ÝÉ¥Ñ…‰±”õ½Ì¹…•ÍÌ¡MQQ}AQ ¹Á…É•¹Ð±½Ì¹]}=,¤±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤)…ÁÀ¹•Ð ˆ½‰É½­•Èµ¡•…±Ñ ˆ¤)‘•˜‰É½­•É}¡•…±Ñ  ¤è(€€€É•ÍÕ±Ðõ‰É½­•É}¡•…±Ñ¡}‘…Ñ„ ¤íÉ•ÑÕÉ¸©Í½¹¥™ä¡É•ÍÕ±Ð¤° ÈÀÀ¥˜É•ÍÕ±Ñl‰ÍÑ…ÑÕÌ‰tôô‰½¬ˆ•±Í”€ÔÀÌ¤)…ÁÀ¹•Ð ˆ½É•Í•Ðµ¡•…±Ñ ˆ¤)‘•˜É•Í•Ñ}¡•…±Ñ  ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡É•Í•Ñ}ÍÑ…ÑÕÌ ¤¤)…ÁÀ¹•Ð ˆ½Í•ÍÍ¥½¸µ¡•…±Ñ ˆ¤)‘•˜Í•ÍÍ¥½¹}¡•…±Ñ  ¤è(€€€€ˆˆ‰AÕ‰±¥Œ°¹½¸µÍ•¹Í¥Ñ¥Ù”±…Õ¹ ÁÉ½½˜è½Õ¹ÑÌ…¹ÍÑ…Ñ•Ì½¹±ä¸ˆˆˆ(€€€Í¡•‘Õ±•É}Á…Ñ õA…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}M!U1I}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µÍ¡•‘Õ±•È¹©Í½¸ˆ¤¤(€€€ÑÉäéÍ¡•‘Õ±•Èõ©Í½¸¹±½…‘Ì¡Í¡•‘Õ±•É}Á…Ñ ¹É•…‘}Ñ•áÐ ¤¤(€€€•á•ÁÐ€¡=MÉÉ½È±Y…±Õ•ÉÉ½È¤éÍ¡•‘Õ±•Èõíô(€€€É•ÍÕ±ÐõÍ¡•‘Õ±•È¹•Ð ‰É•ÍÕ±Ðˆ¤¥˜¥Í¥¹ÍÑ…¹”¡Í¡•‘Õ±•È¹•Ð ‰É•ÍÕ±Ðˆ¤±‘¥Ð¤•±Í”íô(€€€Í…Ù•õ±½…‘}ÍÑ…Ñ” ¤íÁ…å±½…õì‰ÍÑ…ÑÕÌˆè‰½¬ˆ°‰Á…Á•É}µ½‘”ˆéÁ…Á•È ¤°‰…±±½…Ñ¥½¸ˆéÍ…Ù•¹•Ð ‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ðˆ¤°‰ÉÕ¹¹¥¹œˆéÍ…Ù•¹•Ð ‰ÉÕ¹¹¥¹œˆ¤°‰•¹ÑÉå}½¹™¥Éµ…Ñ¥½¹}ÁÐˆé¹Õµ‰•È¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}9QIe}=9%I5Q%=9}APˆ¤¤½È€À¸ÀÀÄ°‰ÑÉ…¥±¥¹}‘É½Á}ÁÐˆèÀ¸ÀÔ°‰‰•±½Ý}•¹ÑÉå}•á¥ÐˆéQÉÕ”°‰Í¡•‘Õ±•É}ÍÑ…ÑÕÌˆéÍ¡•‘Õ±•È¹•Ð ‰ÍÑ…ÑÕÌˆ°‰Ý…¥Ñ¥¹œˆ¤°‰Í¡•‘Õ±•É}•ÉÉ½É}ÑåÁ”ˆéÍ¡•‘Õ±•È¹•Ð ‰•ÉÉ½É}ÑåÁ”ˆ¤°‰Á•¹‘¥¹}É•…Í½¸ˆéÍ¡•‘Õ±•È¹•Ð ‰Á•¹‘¥¹}É•…Í½¸ˆ¤°‰Í•±•Ñ•ˆé±•¸¡Í…Ù•¹•Ð ‰Í•±•Ñ•‘}Ý…Ñ¡±¥ÍÐˆ¤½Èmt¤°‰ÅÕ…±¥™¥•‘}Ñ½‘…äˆéÍ…Ù•¹•Ð ‰±…ÍÑ}ÅÕ…±¥™¥•‘}½Õ¹Ðˆ¤°‰•±¥¥‰±•}…¹‘¥‘…Ñ•ÌˆéÉ•ÍÕ±Ð¹•Ð ‰•±¥¥‰±•}…¹‘¥‘…Ñ•Ìˆ¤°‰ÍÕ‰µ¥ÑÑ•‘}½É‘•ÉÌˆéÉ•ÍÕ±Ð¹•Ð ‰½É‘•ÉÌˆ¤°‰Ñ¥µ•ÍÑ…µÀˆé¹½Ü ¥ô(€€€ÑÉäè(€€€€€€€±¥™•å±”õ©Í½¸¹±½…‘Ì¡A…Ñ ¡½Ì¹•Ñ•¹Ø ‰5=MEU%Q=}1%e1}%1ˆ°ˆ½‘…Ñ„½µ½ÍÅÕ¥Ñ¼µ±¥™•å±”¹©Í½¸ˆ¤¤¹É•…‘}Ñ•áÐ ¤¤(€€€€€€€Á…å±½…‘l‰±¥™•å±•}½É‘•ÉÌ‰tõ±•¸¡±¥™•å±”¹•Ð ‰½É‘•ÉÌˆ¤½Èíô¤(€€€€€€€Á…å±½…‘l‰±¥™•å±•}Á½Í¥Ñ¥½¹Ì‰tõ±•¸¡±¥™•å±”¹•Ð ‰Á½Í¥Ñ¥½¹Ìˆ¤½Èíô¤(€€€€€€€Á…å±½…‘l‰É•Ñ¥É•‘}Á½Í¥Ñ¥½¹Ì‰tõ±•¸¡±¥™•å±”¹•Ð ‰É•Ñ¥É•ˆ¤½Èíô¤(€€€•á•ÁÐ€¡=MÉÉ½È±Y…±Õ•ÉÉ½È±QåÁ•ÉÉ½È¤éÁ…ÍÌ(€€€ÑÉäè(€€€€€€€Á…å±½…‘l‰½Á•¹}Á½Í¥Ñ¥½¹Ì‰tõ±•¸¡±¥•¹Ð ¤¹•Ñ}…±±}Á½Í¥Ñ¥½¹Ì ¤¤(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐEÕ•Éå=É‘•ÉMÑ…ÑÕÌ(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ(€€€€€€€Á…å±½…‘l‰½Á•¹}½É‘•ÉÌ‰tõ±•¸¡±¥•¹Ð ¤¹•Ñ}½É‘•ÉÌ¡™¥±Ñ•Èõ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ¡ÍÑ…ÑÕÌõEÕ•Éå=É‘•ÉMÑ…ÑÕÌ¹=A8±±¥µ¥ÐôÄÀÀ¤¤¤(€€€•á•ÁÐá•ÁÑ¥½¸éÁ…å±½…¹ÕÁ‘…Ñ”¡ÍÑ…ÑÕÌô‰‘•É…‘•ˆ±½Á•¹}Á½Í¥Ñ¥½¹Ìõ9½¹”±½Á•¹}½É‘•ÉÌõ9½¹”¤(€€€É•ÑÕÉ¸©Í½¹¥™ä¡Á…å±½…¤° ÈÀÀ¥˜Á…å±½…‘l‰ÍÑ…ÑÕÌ‰tôô‰½¬ˆ•±Í”€ÔÀÌ¤)‘•˜…½Õ¹Ñ}‘…Ñ„ ¤è(€€€„õ±¥•¹Ð ¤¹•Ñ}…½Õ¹Ð ¤ì™¥•±‘Ìô ‰¥ˆ°‰ÍÑ…ÑÕÌˆ°‰ÕÉÉ•¹äˆ°‰…Í ˆ°‰Á½ÉÑ™½±¥½}Ù…±Õ”ˆ°‰•ÅÕ¥Ñäˆ°‰±…ÍÑ}•ÅÕ¥Ñäˆ°‰‰Õå¥¹}Á½Ý•Èˆ°‰‘…åÑÉ…‘¥¹}‰Õå¥¹}Á½Ý•Èˆ°‰É•Ñ}‰Õå¥¹}Á½Ý•Èˆ°‰ÑÉ…‘¥¹}‰±½­•ˆ°‰ÑÉ…¹Í™•ÉÍ}‰±½­•ˆ°‰…½Õ¹Ñ}‰±½­•ˆ°‰Á…ÑÑ•É¹}‘…å}ÑÉ…‘•Èˆ°‰‘…åÑÉ…‘•}½Õ¹Ðˆ¤(€€€É•ÍÕ±Ðõì¨©í˜éÍ•É¥…°¡•Ñ…ÑÑÈ¡„±˜±9½¹”¤¤™½È˜¥¸™¥•±‘Íô°‰½¹¹•Ñ•ˆéQÉÕ”°‰µ½‘”ˆè‰Á…Á•Èˆ¥˜Á…Á•È ¤•±Í”€‰±¥Ù”‰ô(€€€•ÅÕ¥Ñä±±…ÍÐõ¹Õµ‰•È¡É•ÍÕ±Ð¹•Ð ‰•ÅÕ¥Ñäˆ¤¤±¹Õµ‰•È¡É•ÍÕ±Ð¹•Ð ‰±…ÍÑ}•ÅÕ¥Ñäˆ¤¤íÉ…Ý}•ÅÕ¥Ñäõ•ÅÕ¥Ñä(€€€É•ÍÕ±Ñl‰‘…å}ÁÉ½™¥Ð‰tô¡•ÅÕ¥Ñäµ±…ÍÐ¤¥˜•ÅÕ¥Ñä¥Ì¹½Ð9½¹”…¹±…ÍÐ¥Ì¹½Ð9½¹”•±Í”9½¹”(€€€É•ÍÕ±Ñl‰‘…å}ÁÉ½™¥Ñ}ÁÐ‰tô ¡•ÅÕ¥Ñäµ±…ÍÐ¤½±…ÍÐ¨ÄÀÀ¤¥˜•ÅÕ¥Ñä¥Ì¹½Ð9½¹”…¹±…ÍÐ¹½Ð¥¸€¡9½¹”°À¤•±Í”9½¹”(€€€Í…Ù•õ±½…‘}ÍÑ…Ñ” ¤íÍÑ…ÉÑ¥¹œõ¹Õµ‰•È¡Í…Ù•¹•Ð ‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ðˆ¤¤í‰…Í•±¥¹”õ¹Õµ‰•È¡Í…Ù•¹•Ð ‰‰…Í•±¥¹•}•ÅÕ¥Ñäˆ¤¤(€€€¥˜É…Ý}•ÅÕ¥Ñä¥Ì¹½Ð9½¹”…¹‰…Í•±¥¹”¥Ì¹½Ð9½¹”…¹ÍÑ…ÉÑ¥¹œ¹½Ð¥¸€¡9½¹”°À¤è(€€€€€€€ÍÑÉ…Ñ•å}ÁÉ½™¥ÐõÉ…Ý}•ÅÕ¥Ñäµ‰…Í•±¥¹”íÉ•ÍÕ±Ñl‰‰É½­•É}•ÅÕ¥Ñä‰tõÉ•ÍÕ±Ð¹•Ð ‰•ÅÕ¥Ñäˆ¤íÉ•ÍÕ±Ñl‰‰É½­•É}Á½ÉÑ™½±¥½}Ù…±Õ”‰tõÉ•ÍÕ±Ð¹•Ð ‰Á½ÉÑ™½±¥½}Ù…±Õ”ˆ¤íÉ•ÍÕ±Ñl‰•ÅÕ¥Ñä‰tõÍÑ…ÉÑ¥¹œ­ÍÑÉ…Ñ•å}ÁÉ½™¥ÐíÉ•ÍÕ±Ñl‰Á½ÉÑ™½±¥½}Ù…±Õ”‰tõÍÑ…ÉÑ¥¹œ­ÍÑÉ…Ñ•å}ÁÉ½™¥ÐíÉ•ÍÕ±Ñl‰‘…å}ÁÉ½™¥Ð‰tõÍÑÉ…Ñ•å}ÁÉ½™¥ÐíÉ•ÍÕ±Ñl‰‘…å}ÁÉ½™¥Ñ}ÁÐ‰tõÍÑÉ…Ñ•å}ÁÉ½™¥Ð½ÍÑ…ÉÑ¥¹œ¨ÄÀÀ(€€€€€€€•ÅÕ¥ÑäõÍÑ…ÉÑ¥¹œ­ÍÑÉ…Ñ•å}ÁÉ½™¥Ð(€€€É•ÍÕ±Ñl‰Ñ½Ñ…±}ÁÉ½™¥Ð‰tô¡•ÅÕ¥ÑäµÍÑ…ÉÑ¥¹œ¤¥˜•ÅÕ¥Ñä¥Ì¹½Ð9½¹”…¹ÍÑ…ÉÑ¥¹œ¹½Ð¥¸€¡9½¹”°À¤•±Í”9½¹”(€€€É•ÍÕ±Ñl‰Ñ½Ñ…±}ÁÉ½™¥Ñ}ÁÐ‰tô ¡•ÅÕ¥ÑäµÍÑ…ÉÑ¥¹œ¤½ÍÑ…ÉÑ¥¹œ¨ÄÀÀ¤¥˜•ÅÕ¥Ñä¥Ì¹½Ð9½¹”…¹ÍÑ…ÉÑ¥¹œ¹½Ð¥¸€¡9½¹”°À¤•±Í”9½¹”(€€€É•ÑÕÉ¸É•ÍÕ±Ð)…ÁÀ¹•Ð ˆ½…Á¤½…½Õ¹Ðˆ¤)‘•˜…½Õ¹Ð ¤è(€€€ÑÉäéÉ•ÑÕÉ¸©Í½¹¥™ä¡…¡• ‰…½Õ¹Ðˆ°ÄÀ±…½Õ¹Ñ}‘…Ñ„¤¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒéÉ•ÑÕÉ¸ÕÁÍÑÉ•…´¡•áŒ°‰•Ñ}…½Õ¹Ðˆ°ˆ½ØÈ½…½Õ¹Ðˆ¤)‘•˜Á½Í¥Ñ¥½¹}É½ÝÌ ¤è(€€€™¥•±‘Ìô ‰…ÍÍ•Ñ}¥ˆ°‰Íåµ‰½°ˆ°‰•á¡…¹”ˆ°‰…ÍÍ•Ñ}±…ÍÌˆ°‰ÅÑäˆ°‰Í¥‘”ˆ°‰µ…É­•Ñ}Ù…±Õ”ˆ°‰½ÍÑ}‰…Í¥Ìˆ°‰Õ¹É•…±¥é•‘}Á°ˆ°‰Õ¹É•…±¥é•‘}Á±ÁŒˆ°‰ÕÉÉ•¹Ñ}ÁÉ¥”ˆ°‰±…ÍÑ‘…å}ÁÉ¥”ˆ°‰¡…¹•}Ñ½‘…äˆ°‰…Ù}•¹ÑÉå}ÁÉ¥”ˆ¤(€€€É½ÝÌõmtíÑÉ…­•õíÁl‰Íåµ‰½°‰téÀ™½ÈÀ¥¸•¹¥¹”¹ÁÕ‰±¥}ÍÑ…Ñ” ¥l‰Á½Í¥Ñ¥½¹Ì‰uô(€€€™½ÈÀ¥¸±¥•¹Ð ¤¹•Ñ}…±±}Á½Í¥Ñ¥½¹Ì ¤è(€€€€€€€É½Üõí˜éÍ•É¥…°¡•Ñ…ÑÑÈ¡À±˜±9½¹”¤¤™½È˜¥¸™¥•±‘Íô(€€€€€€€ÅÑäõ¹Õµ‰•È¡É½Ü¹•Ð ‰ÅÑäˆ¤¤ì•¹ÑÉäõ¹Õµ‰•È¡É½Ü¹•Ð ‰…Ù}•¹ÑÉå}ÁÉ¥”ˆ¤¤ìÕÉÉ•¹Ðõ¹Õµ‰•È¡É½Ü¹•Ð ‰ÕÉÉ•¹Ñ}ÁÉ¥”ˆ¤¤ì½ÍÐõ¹Õµ‰•È¡É½Ü¹•Ð ‰½ÍÑ}‰…Í¥Ìˆ¤¤(€€€€€€€¥˜•¹ÑÉä¥Ì9½¹”…¹ÅÑä¹½Ð¥¸€¡9½¹”°À¤…¹½ÍÐ¥Ì¹½Ð9½¹”é•¹ÑÉäõ½ÍÐ½ÅÑä(€€€€€€€¥˜•¹ÑÉä…¹ÕÉÉ•¹Ðè(€€€€€€€€€€€Õ…ÉõÁÉ½Ñ•Ñ•‘}ÍÑ…Ñ”¡•¹ÑÉä±ÕÉÉ•¹Ð±ÑÉ…­•¹•Ð¡ÍÑÈ¡É½Ü¹•Ð ‰Íåµ‰½°ˆ¤¤±íô¤¹•Ð ‰Á•…­}ÁÉ¥”ˆ¤¤(€€€€€€€€€€€É½Ü¹ÕÁ‘…Ñ”¡í¬éÉ½Õ¹¡Ø°Ø¤¥˜¥Í¥¹ÍÑ…¹”¡Ø±™±½…Ð¤•±Í”Ø™½È¬±Ø¥¸Õ…É¹¥Ñ•µÌ ¥ô¤(€€€€€€€É½ÝÌ¹…ÁÁ•¹¡É½Ü¤(€€€É•ÑÕÉ¸É½ÝÌ)…ÁÀ¹•Ð ˆ½…Á¤½•¹¥¹”ˆ¤)‘•˜•¹¥¹•}ÍÑ…ÑÕÌ ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡•¹¥¹”¹ÁÕ‰±¥}ÍÑ…Ñ” ¤¤)…ÁÀ¹•Ð ˆ½…Á¤½Á½Í¥Ñ¥½¹Ìˆ¤)‘•˜Á½Í¥Ñ¥½¹Ì ¤è(€€€ÑÉäéÈõ…¡• ‰Á½Í¥Ñ¥½¹Ìˆ°à±Á½Í¥Ñ¥½¹}É½ÝÌ¤íÉ•ÑÕÉ¸©Í½¹¥™ä¡Á½Í¥Ñ¥½¹ÌõÈ±½Õ¹Ðõ±•¸¡È¤±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒéÉ•ÑÕÉ¸ÕÁÍÑÉ•…´¡•áŒ°‰•Ñ}Á½Í¥Ñ¥½¹Ìˆ°ˆ½ØÈ½Á½Í¥Ñ¥½¹Ìˆ¤)…ÁÀ¹•Ð ˆ½…Á¤½½É‘•ÉÌˆ¤)‘•˜½É‘•ÉÌ ¤è(€€€ÑÉäè(€€€€€€€ÍÑ…ÑÕÌõÉ•ÅÕ•ÍÐ¹…ÉÌ¹•Ð ‰ÍÑ…ÑÕÌˆ°‰…±°ˆ¤¹±½Ý•È ¤(€€€€€€€¥˜ÍÑ…ÑÕÌ¹½Ð¥¸ì‰…±°ˆ°‰½Á•¸ˆ°‰±½Í•‰ôéÉ•ÑÕÉ¸•ÉÉ½È ‰ÍÑ…ÑÕÌµÕÍÐ‰”…±°°½Á•¸°½È±½Í•ˆ¤(€€€€€€€‘•˜•Ð ¤è(€€€€€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐEÕ•Éå=É‘•ÉMÑ…ÑÕÌ(€€€€€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ(€€€€€€€€€€€É•ÑÕÉ¸mÍ•É¥…°¡¼¤™½È¼¥¸±¥•¹Ð ¤¹•Ñ}½É‘•ÉÌ¡™¥±Ñ•Èõ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ¡ÍÑ…ÑÕÌõì‰…±°ˆéEÕ•Éå=É‘•ÉMÑ…ÑÕÌ¹10°‰½Á•¸ˆéEÕ•Éå=É‘•ÉMÑ…ÑÕÌ¹=A8°‰±½Í•ˆéEÕ•Éå=É‘•ÉMÑ…ÑÕÌ¹1=MõmÍÑ…ÑÕÍt±±¥µ¥ÐôÄÀÀ¤¥t(€€€€€€€Èõ…¡• ‰½É‘•ÉÌèˆ­ÍÑ…ÑÕÌ°à±•Ð¤íÉ•ÑÕÉ¸©Í½¹¥™ä¡½É‘•ÉÌõÈ±½Õ¹Ðõ±•¸¡È¤±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒéÉ•ÑÕÉ¸ÕÁÍÑÉ•…´¡•áŒ°‰•Ñ}½É‘•ÉÌˆ°ˆ½ØÈ½½É‘•ÉÌˆ¤)…ÁÀ¹•Ð ˆ½…Á¤½Á½ÉÑ™½±¥¼µ¡¥ÍÑ½Éäˆ¤)‘•˜¡¥ÍÑ½Éä ¤è(€€€Á•É¥½õÉ•ÅÕ•ÍÐ¹…ÉÌ¹•Ð ‰Á•É¥½ˆ°ˆÅˆ¤í™É…µ”õÉ•ÅÕ•ÍÐ¹…ÉÌ¹•Ð ‰Ñ¥µ•™É…µ”ˆ°ˆÕ5¥¸ˆ¤(€€€¥˜Á•É¥½¹½Ð¥¸ìˆÅˆ°ˆÅ\ˆ°ˆÅ4ˆ°ˆÍ4ˆ°ˆÅ‰ô½È™É…µ”¹½Ð¥¸ìˆÅ5¥¸ˆ°ˆÕ5¥¸ˆ°ˆÄÕ5¥¸ˆ°ˆÅ ˆ°ˆÅ‰ôéÉ•ÑÕÉ¸•ÉÉ½È ‰U¹ÍÕÁÁ½ÉÑ•¡¥ÍÑ½ÉäÁ•É¥½½ÈÑ¥µ•™É…µ”ˆ¤(€€€ÑÉäè(€€€€€€€‘•˜•Ð ¤è(€€€€€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•ÑA½ÉÑ™½±¥½!¥ÍÑ½ÉåI•ÅÕ•ÍÐ(€€€€€€€€€€€ õ±¥•¹Ð ¤¹•Ñ}Á½ÉÑ™½±¥½}¡¥ÍÑ½Éä¡•ÑA½ÉÑ™½±¥½!¥ÍÑ½ÉåI•ÅÕ•ÍÐ¡Á•É¥½õÁ•É¥½±Ñ¥µ•™É…µ”õ™É…µ”±•áÑ•¹‘•‘}¡½ÕÉÌõQÉÕ”¤¤(€€€€€€€€€€€É•ÑÕÉ¸ì‰Ñ¥µ•ÍÑ…µÀˆéÍ•É¥…°¡ ¹Ñ¥µ•ÍÑ…µÀ¤°‰•ÅÕ¥ÑäˆéÍ•É¥…°¡ ¹•ÅÕ¥Ñä¤°‰ÁÉ½™¥Ñ}±½ÍÌˆéÍ•É¥…°¡ ¹ÁÉ½™¥Ñ}±½ÍÌ¤°‰ÁÉ½™¥Ñ}±½ÍÍ}ÁÐˆéÍ•É¥…°¡ ¹ÁÉ½™¥Ñ}±½ÍÍ}ÁÐ¤°‰‰…Í•}Ù…±Õ”ˆéÍ•É¥…°¡ ¹‰…Í•}Ù…±Õ”¤°‰Á•É¥½ˆéÁ•É¥½°‰Ñ¥µ•™É…µ”ˆé™É…µ•ô(€€€€€€€É•ÑÕÉ¸©Í½¹¥™ä¡…¡•¡˜‰¡¥ÍÑ½ÉäéíÁ•É¥½‘ôéí™É…µ•ôˆ°ÌÀ±•Ð¤¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒéÉ•ÑÕÉ¸ÕÁÍÑÉ•…´¡•áŒ°‰•Ñ}Á½ÉÑ™½±¥½}¡¥ÍÑ½Éäˆ°ˆ½ØÈ½…½Õ¹Ð½Á½ÉÑ™½±¥¼½¡¥ÍÑ½Éäˆ¤)…ÁÀ¹•Ð ˆ½…Á¤½½¹™¥œˆ¤)‘•˜•Ñ}½¹™¥œ ¤è(€€€Ìõ±½…‘}ÍÑ…Ñ” ¤íÉ•ÑÕÉ¸©Í½¹¥™ä ¨©í¬éÍm­t™½È¬¥¸€ ‰…±±½…Ñ¥½¸ˆ°‰‘…¥±å}½…°ˆ°‰ÕÁ‘…Ñ•‘}…Ðˆ¥ô¤)‘•˜¹½¹¹•…Ñ¥Ù”¡Ø±±…‰•°¤è(€€€¸õ¹Õµ‰•È¡Ø¤(€€€¥˜¸¥Ì9½¹”½È¸ðÀéÉ…¥Í”Y…±Õ•ÉÉ½È¡˜‰í±…‰•±ôµÕÍÐ‰”„™¥¹¥Ñ”°¹½¹¹•…Ñ¥Ù”¹Õµ‰•Èˆ¤(€€€É•ÑÕÉ¸¸)…ÁÀ¹Á½ÍÐ ˆ½…Á¤½½¹™¥œˆ¤)É…Ñ•}±¥µ¥Ð ¤)‘•˜Í•Ñ}½¹™¥œ ¤è(€€€‰½‘äõÉ•ÅÕ•ÍÐ¹•Ñ}©Í½¸¡Í¥±•¹ÐõQÉÕ”¤(€€€¥˜¹½Ð¥Í¥¹ÍÑ…¹”¡‰½‘ä±‘¥Ð¤éÉ•ÑÕÉ¸•ÉÉ½È ‰)M=8½‰©•Ð¥ÌÉ•ÅÕ¥É•ˆ¤(€€€Ìõ±½…‘}ÍÑ…Ñ” ¤(€€€ÑÉäè(€€€€€€€¥˜€‰…±±½…Ñ¥½¸ˆ¥¸‰½‘äéÍl‰…±±½…Ñ¥½¸‰tõ¹½¹¹•…Ñ¥Ù”¡‰½‘ål‰…±±½…Ñ¥½¸‰t°‰…±±½…Ñ¥½¸ˆ¤(€€€€€€€¥˜€‰‘…¥±å}½…°ˆ¥¸‰½‘äéÍl‰‘…¥±å}½…°‰tõ¹½¹¹•…Ñ¥Ù”¡‰½‘ål‰‘…¥±å}½…°‰t°‰‘…¥±å}½…°ˆ¤(€€€•á•ÁÐY…±Õ•ÉÉ½È…Ì•áŒéÉ•ÑÕÉ¸•ÉÉ½È¡ÍÑÈ¡•áŒ¤¤(€€€Í…Ù•}ÍÑ…Ñ”¡Ì¤íÌõ±½…‘}ÍÑ…Ñ” ¤íÉ•ÑÕÉ¸©Í½¹¥™ä ¨©í¬éÍm­t™½È¬¥¸€ ‰…±±½…Ñ¥½¸ˆ°‰‘…¥±å}½…°ˆ°‰ÕÁ‘…Ñ•‘}…Ðˆ¥ô¤)…ÁÀ¹Á½ÍÐ ˆ½…Á¤½Í…¸ˆ¤)É…Ñ•}±¥µ¥Ð Ø¤)‘•˜Í…¸ ¤è(€€€ÑÉäè(€€€€€€€½Õ¹Ðõ¥¹Ð ¡É•ÅÕ•ÍÐ¹•Ñ}©Í½¸¡Í¥±•¹ÐõQÉÕ”¤½Èíô¤¹•Ð ‰½Õ¹Ðˆ°ÔÀ¤¤(€€€€€€€¥˜¹½Ð€Äðõ½Õ¹ÐðôÈÀÀéÉ…¥Í”Y…±Õ•ÉÉ½È(€€€€€€€Èõ…¡•¡˜‰Í…¸éí½Õ¹Ñôˆ°ÌÀÀ±±…µ‰‘„é‰Õ¥±‘}Ý…Ñ¡±¥ÍÐ¡½Õ¹Ð¤¤íÌõ±½…‘}ÍÑ…Ñ” ¤íÌ¹ÕÁ‘…Ñ”¡±…ÍÑ}Í…¸õÈ¹•Ð ‰•¹•É…Ñ•‘}…Ðˆ±¹½Ü ¤¤±±…ÍÑ}•ÉÉ½Èõ9½¹”¤íÍ…Ù•}ÍÑ…Ñ”¡Ì¤íÉ•ÑÕÉ¸©Í½¹¥™ä¡È¤(€€€•á•ÁÐ€¡QåÁ•ÉÉ½È±Y…±Õ•ÉÉ½È¤éÉ•ÑÕÉ¸•ÉÉ½È ‰½Õ¹ÐµÕÍÐ‰”…¸¥¹Ñ••È™É½´€ÄÑ¡É½Õ €ÈÀÀˆ¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€Ìõ±½…‘}ÍÑ…Ñ” ¤íÍl‰±…ÍÑ}•ÉÉ½È‰tô‰5…É­•ÐÍ…¸Õ¹…Ù…¥±…‰±”ˆíÍ…Ù•}ÍÑ…Ñ”¡Ì¤í…ÁÀ¹±½•È¹Ý…É¹¥¹œ ‰Í…¸™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤íÉ•ÑÕÉ¸•ÉÉ½È ‰5…É­•ÐÍ…¸¥ÌÑ•µÁ½É…É¥±äÕ¹…Ù…¥±…‰±”ˆ°ÔÀÌ¤)‘•˜ÍÑ…ÑÕÍ}‘…Ñ„ ¤è(€€€¬±ÌõÉ•‘•¹Ñ¥…±Ì ¤íÍÐõ±½…‘}ÍÑ…Ñ” ¤íÉ•ÑÕÉ¸ì‰¹…µ”ˆè‰5½ÍÅÕ¥Ñ¼$QÉ…‘¥¹œ	½Ðˆ°‰ÍÑÉ…Ñ•äˆè‰XÔ¸à5…ÍÑ•Èˆ°‰ÉÕ¹¹¥¹œˆé‰½½°¡ÍÑl‰ÉÕ¹¹¥¹œ‰t¤°‰µ½‘”ˆè‰Á…Á•Èˆ¥˜Á…Á•È ¤•±Í”€‰±¥Ù”ˆ°‰…±Á……}½¹™¥ÕÉ•ˆé‰½½°¡¬…¹Ì¤°‰½É‘•É}•á•ÕÑ¥½¸ˆé•¹…‰±• ¤°‰½É‘•É}•á•ÕÑ¥½¹}•¹…‰±•ˆé•¹…‰±• ¤°‰…±±½…Ñ¥½¸ˆéÍÑl‰…±±½…Ñ¥½¸‰t°‰¥¹Ù•ÍÑµ•¹Ñ}…µ½Õ¹ÐˆéÍÑl‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ð‰t°‰‘…¥±å}½…°ˆéÍÑl‰‘…¥±å}½…°‰t°‰•á¥Ñ}ÍÑ…ÑÕÌˆéÍÑl‰•á¥Ñ}ÍÑ…ÑÕÌ‰t°‰•á¥Ñ}É•ÅÕ•ÍÑ}¥ˆéÍÑl‰•á¥Ñ}É•ÅÕ•ÍÑ}¥‰t°‰É¥Í­}ÍÑ…ÑÕÌˆè‰Mˆ¥˜Á…Á•È ¤•±Í”€‰1%Yˆ°‰É¥Í­}‘•Ñ…¥°ˆè‰A…Á•ÈÑÉ…‘¥¹œµ½‘”ˆ¥˜Á…Á•È ¤•±Í”€‰1¥Ù”•á•ÕÑ¥½¸•¹…‰±•ˆ°‰±…ÍÑ}Í…¸ˆéÍÑl‰±…ÍÑ}Í…¸‰t°‰±…ÍÑ}•ÉÉ½ÈˆéÍÑl‰±…ÍÑ}•ÉÉ½È‰t°‰Ñ¥µ•ÍÑ…µÀˆé¹½Ü ¥ô)…ÁÀ¹•Ð ˆ½…Á¤½ÍÑ…ÑÕÌˆ¤)‘•˜ÍÑ…ÑÕÌ ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡ÍÑ…ÑÕÍ}‘…Ñ„ ¤¤)…ÁÀ¹•Ð ˆ½…Á¤½…±•ÉÑÌˆ¤)‘•˜…±•ÉÑÌ ¤è(€€€½ÕÐõmtíÌõ±½…‘}ÍÑ…Ñ” ¤(€€€¥˜Íl‰±…ÍÑ}•ÉÉ½È‰té½ÕÐ¹…ÁÁ•¹¡ì‰±•Ù•°ˆè‰•ÉÉ½Èˆ°‰½‘”ˆè‰1MQ}II=Hˆ°‰µ•ÍÍ…”ˆéÍl‰±…ÍÑ}•ÉÉ½È‰uô¤(€€€ÑÉäè(€€€€€€€„õ…¡• ‰…½Õ¹Ðˆ°ÄÀ±…½Õ¹Ñ}‘…Ñ„¤(€€€€€€€™½È™¥•±±µ•ÍÍ…”¥¸€  ‰…½Õ¹Ñ}‰±½­•ˆ°‰±Á…„…½Õ¹Ð¥Ì‰±½­•ˆ¤° ‰ÑÉ…‘¥¹}‰±½­•ˆ°‰QÉ…‘¥¹œ¥Ì‰±½­•ˆ¤° ‰ÑÉ…¹Í™•ÉÍ}‰±½­•ˆ°‰QÉ…¹Í™•ÉÌ…É”‰±½­•ˆ¤¤è(€€€€€€€€€€€¥˜„¹•Ð¡™¥•±¤¥ÌQÉÕ”é½ÕÐ¹…ÁÁ•¹¡ì‰±•Ù•°ˆè‰É¥Ñ¥…°ˆ°‰½‘”ˆé™¥•±¹ÕÁÁ•È ¤°‰µ•ÍÍ…”ˆéµ•ÍÍ…•ô¤(€€€•á•ÁÐá•ÁÑ¥½¸é½ÕÐ¹…ÁÁ•¹¡ì‰±•Ù•°ˆè‰Ý…É¹¥¹œˆ°‰½‘”ˆè‰	I=-I}U9Y%1	1ˆ°‰µ•ÍÍ…”ˆè‰	É½­•ÈÍÑ…ÑÕÌ¥ÌÕ¹…Ù…¥±…‰±”‰ô¤(€€€É•ÑÕÉ¸©Í½¹¥™ä¡…±•ÉÑÌõ½ÕÐ±½Õ¹Ðõ±•¸¡½ÕÐ¤±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤)…ÁÀ¹•Ð ˆ½…Á¤½‘…Í¡‰½…Éˆ¤)‘•˜‘…Í¡‰½…É‘}‘…Ñ„ ¤è(€€€ÍÐõ±½…‘}ÍÑ…Ñ” ¤íÈõì‰ÍÑ…ÑÕÌˆéÍÑ…ÑÕÍ}‘…Ñ„ ¤°‰½¹™¥œˆéì‰…±±½…Ñ¥½¸ˆéÍÑl‰…±±½…Ñ¥½¸‰t°‰‘…¥±å}½…°ˆéÍÑl‰‘…¥±å}½…°‰uô°‰Ñ¥µ•ÍÑ…µÀˆé¹½Ü ¤°‰•ÉÉ½ÉÌˆémuô(€€€ÑÉäéÉl‰…½Õ¹Ð‰tõ…¡• ‰…½Õ¹Ðˆ°ÄÀ±…½Õ¹Ñ}‘…Ñ„¤(€€€•á•ÁÐá•ÁÑ¥½¸éÉl‰…½Õ¹Ð‰tõ9½¹”íÉl‰•ÉÉ½ÉÌ‰t¹…ÁÁ•¹ ‰…½Õ¹Ðˆ¤(€€€ÑÉäéÉl‰Á½Í¥Ñ¥½¹Ì‰tõ…¡• ‰Á½Í¥Ñ¥½¹Ìˆ°à±Á½Í¥Ñ¥½¹}É½ÝÌ¤(€€€•á•ÁÐá•ÁÑ¥½¸éÉl‰Á½Í¥Ñ¥½¹Ì‰tõ9½¹”íÉl‰•ÉÉ½ÉÌ‰t¹…ÁÁ•¹ ‰Á½Í¥Ñ¥½¹Ìˆ¤(€€€Él‰Á½Í¥Ñ¥½¹Í}½Õ¹Ð‰tõ±•¸¡Él‰Á½Í¥Ñ¥½¹Ì‰t¤¥˜¥Í¥¹ÍÑ…¹”¡Él‰Á½Í¥Ñ¥½¹Ì‰t±±¥ÍÐ¤•±Í”9½¹”íÉl‰Ý…Ñ¡±¥ÍÐ‰tõÍÐ¹•Ð ‰Í•±•Ñ•‘}Ý…Ñ¡±¥ÍÐˆ¤½Èmt(€€€È¹ÕÁ‘…Ñ”¡ÑÉ…‘•Í}Ñ½‘…äõ9½¹”±Ý¥¹}É…Ñ”õ9½¹”±ÑÉ…‘•Ìõmt±Á•É™½Éµ…¹”õmt¤(€€€ÑÉäè(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐEÕ•Éå=É‘•ÉMÑ…ÑÕÌ(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ(€€€€€€€½É‘•ÉÌõmÍ•É¥…°¡¼¤™½È¼¥¸±¥•¹Ð ¤¹•Ñ}½É‘•ÉÌ¡™¥±Ñ•Èõ•Ñ=É‘•ÉÍI•ÅÕ•ÍÐ¡ÍÑ…ÑÕÌõEÕ•Éå=É‘•ÉMÑ…ÑÕÌ¹1=M±±¥µ¥ÐôÄÀÀ¤¥t(€€€€€€€Ñ½‘…äõ‘…Ñ•Ñ¥µ”¹¹½Ü¡Ñ¥µ•é½¹”¹ÕÑŒ¤¹‘…Ñ” ¤í™¥±±•õmtí…±±}™¥±±•õmt(€€€€€€€™½È½É‘•È¥¸½É‘•ÉÌè(€€€€€€€€€€€ÍÑ…µÀõ½É‘•È¹•Ð ‰™¥±±•‘}…Ðˆ¤(€€€€€€€€€€€ÑÉäé¥Í}Ñ½‘…äõ‘…Ñ•Ñ¥µ”¹™É½µ¥Í½™½Éµ…Ð¡ÍÑÈ¡ÍÑ…µÀ¤¹É•Á±…” ‰hˆ°ˆ¬ÀÀèÀÀˆ¤¤¹…ÍÑ¥µ•é½¹”¡Ñ¥µ•é½¹”¹ÕÑŒ¤¹‘…Ñ” ¤ôõÑ½‘…ä(€€€€€€€€€€€•á•ÁÐ€¡QåÁ•ÉÉ½È±Y…±Õ•ÉÉ½È¤é¥Í}Ñ½‘…äõ…±Í”(€€€€€€€€€€€¥˜½É‘•È¹•Ð ‰™¥±±•‘}ÅÑäˆ¤¹½Ð¥¸€¡9½¹”°ˆÀˆ°À¤è(€€€€€€€€€€€€€€€…±±}™¥±±•¹…ÁÁ•¹¡½É‘•È¤(€€€€€€€€€€€€€€€¥˜¥Í}Ñ½‘…äé™¥±±•¹…ÁÁ•¹¡½É‘•È¤(€€€€€€€Él‰ÑÉ…‘•Ì‰tõmì‰Íåµ‰½°ˆé¼¹•Ð ‰Íåµ‰½°ˆ¤°‰Í¥‘”ˆé¼¹•Ð ‰Í¥‘”ˆ¤°‰ÅÑäˆé¼¹•Ð ‰™¥±±•‘}ÅÑäˆ¤°‰ÁÉ¥”ˆé¼¹•Ð ‰™¥±±•‘}…Ù}ÁÉ¥”ˆ¤°‰Ñ¥µ•ÍÑ…µÀˆé¼¹•Ð ‰™¥±±•‘}…Ðˆ¤°‰ÍÑ…ÑÕÌˆé¼¹•Ð ‰ÍÑ…ÑÕÌˆ¥ô™½È¼¥¸…±±}™¥±±•‘t(€€€€€€€Él‰ÑÉ…‘•Í}Ñ½‘…ä‰tõ±•¸¡™¥±±•¤(€€€€€€€ÑÉäè(€€€€€€€€€€€É•Ñ¥É•õ±¥™•å±•}™½È¡±¥•¹Ð ¤¤¹}±½… ¤¹•Ð ‰É•Ñ¥É•ˆ±íô¤íÝ¥¹ÌôÀ(€€€€€€€€€€€™½ÈÍåµ‰½°±±½Ð¥¸É•Ñ¥É•¹¥Ñ•µÌ ¤è(€€€€€€€€€€€€€€€¥˜¹½Ð±½Ð¹•Ð ‰•á¥Ñ}ÁÉ¥”ˆ¤é½¹Ñ¥¹Õ”(€€€€€€€€€€€€€€€Él‰ÑÉ…‘•Ì‰t¹•áÑ•¹¡mì‰Íåµ‰½°ˆéÍåµ‰½°°‰Í¥‘”ˆè‰‰Õäˆ°‰ÅÑäˆé±½Ð¹•Ð ‰ÅÑäˆ¤°‰ÁÉ¥”ˆé±½Ð¹•Ð ‰•¹ÑÉå}ÁÉ¥”ˆ¤°‰Ñ¥µ•ÍÑ…µÀˆé±½Ð¹•Ð ‰•¹ÑÉå}…Ðˆ¤°‰ÍÑ…ÑÕÌˆè‰™¥±±•‰ô±ì‰Íåµ‰½°ˆéÍåµ‰½°°‰Í¥‘”ˆè‰Í•±°ˆ°‰ÅÑäˆé±½Ð¹•Ð ‰ÅÑäˆ¤°‰ÁÉ¥”ˆé±½Ð¹•Ð ‰•á¥Ñ}ÁÉ¥”ˆ¤°‰Ñ¥µ•ÍÑ…µÀˆé±½Ð¹•Ð ‰•á¥Ñ•‘}…Ðˆ¤°‰ÍÑ…ÑÕÌˆè‰™¥±±•‰õt¤(€€€€€€€€€€€€€€€¥˜¹Õµ‰•È¡±½Ð¹•Ð ‰•á¥Ñ}ÁÉ¥”ˆ¤¤øõ¹Õµ‰•È¡±½Ð¹•Ð ‰•¹ÑÉå}ÁÉ¥”ˆ¤¤éÝ¥¹Ì¬ôÄ(€€€€€€€€€€€Él‰Ý¥¹}É…Ñ”‰tô¡Ý¥¹Ì½±•¸¡É•Ñ¥É•¤¨ÄÀÀ¤¥˜É•Ñ¥É••±Í”9½¹”(€€€€€€€•á•ÁÐá•ÁÑ¥½¸éÉl‰•ÉÉ½ÉÌ‰t¹…ÁÁ•¹ ‰±¥™•å±•}¡¥ÍÑ½Éäˆ¤(€€€•á•ÁÐá•ÁÑ¥½¸éÉl‰•ÉÉ½ÉÌ‰t¹…ÁÁ•¹ ‰½É‘•ÉÌˆ¤(€€€ÑÉäè(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ•ÑA½ÉÑ™½±¥½!¥ÍÑ½ÉåI•ÅÕ•ÍÐ(€€€€€€€ õ±¥•¹Ð ¤¹•Ñ}Á½ÉÑ™½±¥½}¡¥ÍÑ½Éä¡•ÑA½ÉÑ™½±¥½!¥ÍÑ½ÉåI•ÅÕ•ÍÐ¡Á•É¥½ôˆÅˆ±Ñ¥µ•™É…µ”ôˆÕ5¥¸ˆ±•áÑ•¹‘•‘}¡½ÕÉÌõQÉÕ”¤¤(€€€€€€€ÍÑ…µÁÌ±Ù…±Õ•ÌõÍ•É¥…°¡ ¹Ñ¥µ•ÍÑ…µÀ¤±Í•É¥…°¡ ¹•ÅÕ¥Ñä¤(€€€€€€€Él‰¡¥ÍÑ½Éä‰tõmì‰Ñ¥µ•ÍÑ…µÀˆéÐ°‰•ÅÕ¥ÑäˆéÙô™½ÈÐ±Ø¥¸é¥À¡ÍÑ…µÁÌ±Ù…±Õ•Ì¥t(€€€€€€€¥˜Ù…±Õ•Ìè(€€€€€€€€€€€™¥ÉÍÐ±±…ÍÐõ¹Õµ‰•È¡Ù…±Õ•ÍlÁt¤±¹Õµ‰•È¡Ù…±Õ•Íl´Åt¤(€€€€€€€€€€€Él‰Á•É™½Éµ…¹”‰tõmì‰±…‰•°ˆè‰Q½‘…äˆ°‰ÁÉ½™¥Ðˆè¡±…ÍÐµ™¥ÉÍÐ¤¥˜9½¹”¹½Ð¥¸€¡™¥ÉÍÐ±±…ÍÐ¤•±Í”9½¹”°‰É•ÑÕÉ¹}ÁÐˆè ¡±…ÍÐµ™¥ÉÍÐ¤½™¥ÉÍÐ¨ÄÀÀ¤¥˜™¥ÉÍÐ¹½Ð¥¸€¡9½¹”°À¤…¹±…ÍÐ¥Ì¹½Ð9½¹”•±Í”9½¹”°‰ÑÉ…‘•ÌˆéÉl‰ÑÉ…‘•Í}Ñ½‘…ä‰uõt(€€€•á•ÁÐá•ÁÑ¥½¸éÉl‰¡¥ÍÑ½Éä‰tõmtíÉl‰•ÉÉ½ÉÌ‰t¹…ÁÁ•¹ ‰¡¥ÍÑ½Éäˆ¤(€€€…±•ÉÑÍ|õmt(€€€¥˜ÍÑl‰±…ÍÑ}•ÉÉ½È‰té…±•ÉÑÍ|¹…ÁÁ•¹¡ì‰ÑåÁ”ˆè‰•ÉÉ½Èˆ°‰µ•ÍÍ…”ˆéÍÑl‰±…ÍÑ}•ÉÉ½È‰uô¤(€€€¥˜ÑÉÕÑ¡ä ‰5=MEU%Q=}9	1}M%5U1Q%=8ˆ¤è(€€€€€€€ÑÉäéÉl‰É••¹}É¥‰‰½¸‰tõ…¡• ‰É••¹}É¥‰‰½¸ˆ°ØÀ±Í¥µÕ±…Ñ½È¹Ù…±Õ”¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸éÉl‰É••¹}É¥‰‰½¸‰tõì‰ÍÑ…ÑÕÌˆè‰U9Y%1	1ˆ°‰•ÉÉ½Èˆè‰A…Á•ÈÍ¥µÕ±…Ñ¥½¸ÁÉ¥•Ì…É”Ñ•µÁ½É…É¥±äÕ¹…Ù…¥±…‰±”‰ôíÉl‰•ÉÉ½ÉÌ‰t¹…ÁÁ•¹ ‰É••¹}É¥‰‰½¸ˆ¤(€€€•±Í”éÉl‰É••¹}É¥‰‰½¸‰tõì‰ÍÑ…ÑÕÌˆè‰%M	1‰ô(€€€Él‰…±•ÉÑÌ‰tõ…±•ÉÑÍ|íÉl‰…±•ÉÑÍ}½Õ¹Ð‰tõ±•¸¡…±•ÉÑÍ|¤(€€€É•ÑÕÉ¸©Í½¹¥™ä¡È¤)…ÁÀ¹Á½ÍÐ ˆ½…Á¤½‰½Ð½ÍÑ…ÉÐˆ¤)É…Ñ•}±¥µ¥Ð ¤)‘•˜ÍÑ…ÉÐ ¤è(€€€Ìõ±½…‘}ÍÑ…Ñ” ¤í‰½‘äõÉ•ÅÕ•ÍÐ¹•Ñ}©Í½¸¡Í¥±•¹ÐõQÉÕ”¤½Èíô(€€€ÑÉäéÉ•Äõ¹½¹¹•…Ñ¥Ù”¡‰½‘ä¹•Ð ‰…±±½…Ñ¥½¸ˆ±‰½‘ä¹•Ð ‰¥¹Ù•ÍÑµ•¹Ñ}…µ½Õ¹Ðˆ±Íl‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ð‰t¤¤°‰…±±½…Ñ¥½¸ˆ¤(€€€•á•ÁÐY…±Õ•ÉÉ½È…Ì•áŒéÉ•ÑÕÉ¸•ÉÉ½È¡ÍÑÈ¡•áŒ¤¤(€€€¥˜É•ÄðôÀéÉ•ÑÕÉ¸•ÉÉ½È ‰…±±½…Ñ¥½¸µÕÍÐ‰”É•…Ñ•ÈÑ¡…¸é•É¼ˆ¤(€€€Íl‰É•ÅÕ•ÍÑ•‘}¥¹Ù•ÍÑµ•¹Ð‰tõÉ•Ä(€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€•á•ÁÐ=MÉÉ½È…Ì•áŒè(€€€€€€€…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰	½ÐÍÑ…Ñ”½Õ±¹½Ð‰”Í…Ù•ˆ°ÔÀÀ¤(€€€ÑÉäè(€€€€€€€‰Àõ¹Õµ‰•È¡…¡• ‰…½Õ¹Ðˆ°Ä±…½Õ¹Ñ}‘…Ñ„¤¹•Ð ‰‰Õå¥¹}Á½Ý•Èˆ¤¤(€€€€€€€¥˜‰À¥Ì9½¹”è(€€€€€€€€€€€Íl‰±…ÍÑ}•ÉÉ½È‰tô‰	Õå¥¹œÁ½Ý•È¥ÌÕ¹…Ù…¥±…‰±”ˆíÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰	Õå¥¹œÁ½Ý•È¥ÌÕ¹…Ù…¥±…‰±”ˆ°ÐÀä¤(€€€€€€€…±±½…Ñ¥½¸õµ¥¸¡É•Ä±µ…à À±‰À¤¤(€€€€€€€¥˜…±±½…Ñ¥½¸ðôÀè(€€€€€€€€€€€Íl‰±…ÍÑ}•ÉÉ½È‰tô‰9¼‰Õå¥¹œÁ½Ý•È¥Ì…Ù…¥±…‰±”ˆíÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰9¼‰Õå¥¹œÁ½Ý•È¥Ì…Ù…¥±…‰±”ˆ°ÐÀä¤(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€Íl‰±…ÍÑ}•ÉÉ½È‰tô‰	É½­•ÈÍ•ÉÙ¥”¥ÌÑ•µÁ½É…É¥±äÕ¹…Ù…¥±…‰±”ˆ(€€€€€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€•á•ÁÐ=MÉÉ½È…ÌÍÑ…Ñ•}•áŒé…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”…™Ñ•È‰É½­•È•ÉÉ½Èè€•Ìˆ±ÑåÁ”¡ÍÑ…Ñ•}•áŒ¤¹}}¹…µ•}|¤(€€€€€€€É•ÑÕÉ¸ÕÁÍÑÉ•…´¡•áŒ°‰ÍÑ…ÉÑ}‰½Ñ}•Ñ}…½Õ¹Ðˆ°ˆ½ØÈ½…½Õ¹Ðˆ¤(€€€…±É•…‘äõ‰½½°¡Íl‰ÉÕ¹¹¥¹œ‰t¤íÌ¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõQÉÕ”±…Éµ•õQÉÕ”±…±±½…Ñ¥½¸õ…±±½…Ñ¥½¸±±…ÍÑ}•ÉÉ½Èõ9½¹”¤(€€€Í¥µÕ±…Ñ¥½¸õ9½¹”(€€€¥˜ÑÉÕÑ¡ä ‰5=MEU%Q=}9	1}M%5U1Q%=8ˆ¤è(€€€€€€€ÑÉäéÍ¥µÕ±…Ñ¥½¸õÍ¥µÕ±…Ñ½È¹‰•¥¸¡…±±½…Ñ¥½¸¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€€€€€Ì¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõ…±Í”±±…ÍÑ}•ÉÉ½Èô‰XÔ¸àÁ…Á•ÈÍ¥µÕ±…Ñ¥½¸½Õ±¹½ÐÍÑ…ÉÐˆ¤íÍ…Ù•}ÍÑ…Ñ”¡Ì¤í…ÁÀ¹±½•È¹Ý…É¹¥¹œ ‰Í¥µÕ±…Ñ¥½¸ÍÑ…ÉÐ™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤íÉ•ÑÕÉ¸•ÉÉ½È ‰XÔ¸àÁ…Á•ÈÍ¥µÕ±…Ñ¥½¸½Õ±¹½ÐÍÑ…ÉÐˆ°ÔÀÌ¤(€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€•á•ÁÐ=MÉÉ½È…Ì•áŒè(€€€€€€€…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰	½ÐÍÑ…Ñ”½Õ±¹½Ð‰”Í…Ù•ˆ°ÔÀÀ¤(€€€Ý¥Ñ 1=,é!¹±•…È ¤(€€€•¹ÍÕÉ•}ÉÕ¹Ñ¥µ” ¤(€€€É•ÑÕÉ¸©Í½¹¥™ä¡½¬õQÉÕ”±ÉÕ¹¹¥¹œõQÉÕ”±…±É•…‘å}ÉÕ¹¹¥¹œõ…±É•…‘ä±…±±½…Ñ¥½¸õ…±±½…Ñ¥½¸±É•ÅÕ•ÍÑ•‘}…±±½…Ñ¥½¸õÉ•Ä±…ÁÁ•õ…±±½…Ñ¥½¸ñÉ•Ä±•á•ÕÑ¥½¹}•¹…‰±•õ•¹…‰±• ¤±Í¥µÕ±…Ñ¥½¹}•¹…‰±•õ‰½½°¡Í¥µÕ±…Ñ¥½¸¤±µ½‘”ô‰Á…Á•Èˆ¥˜Á…Á•È ¤•±Í”€‰±¥Ù”ˆ±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤)…ÁÀ¹Á½ÍÐ ˆ½…Á¤½‰½Ð½ÍÑ½Àˆ¤)É…Ñ•}±¥µ¥Ð ¤)‘•˜ÍÑ½À ¤è(€€€Ìõ±½…‘}ÍÑ…Ñ” ¤í…±É•…‘äõ¹½Ð‰½½°¡Íl‰ÉÕ¹¹¥¹œ‰t¤íÌ¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõ…±Í”±…Éµ•õ…±Í”¤(€€€¥˜ÑÉÕÑ¡ä ‰5=MEU%Q=}9	1}M%5U1Q%=8ˆ¤éÍ¥µÕ±…Ñ½È¹ÍÑ½À ¤(€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€•á•ÁÐ=MÉÉ½È…Ì•áŒè(€€€€€€€…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰	½ÐÍÑ…Ñ”½Õ±¹½Ð‰”Í…Ù•ˆ°ÔÀÀ¤(€€€É•ÑÕÉ¸©Í½¹¥™ä¡½¬õQÉÕ”±ÉÕ¹¹¥¹œõ…±Í”±…±É•…‘å}ÍÑ½ÁÁ•õ…±É•…‘ä±Á½Í¥Ñ¥½¹Í}Õ¹¡…¹•õQÉÕ”°(€€€€€€€µ•ÍÍ…”ô‰9•Ü•¹ÑÉ¥•Ì…É”ÍÑ½ÁÁ•ì•á¥ÍÑ¥¹œÁ½Í¥Ñ¥½¹ÌÝ•É”¹½Ð¡…¹•ˆ±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤)…ÁÀ¹Á½ÍÐ ˆ½…Á¤½‰½Ð½•á¥Ðˆ¤)É…Ñ•}±¥µ¥Ð Ô¤)‘•˜•á¥Ñ}‰½Ð ¤è(€€€‰½‘äõÉ•ÅÕ•ÍÐ¹•Ñ}©Í½¸¡Í¥±•¹ÐõQÉÕ”¤(€€€¥˜¹½Ð¥Í¥¹ÍÑ…¹”¡‰½‘ä±‘¥Ð¤½È‰½‘ä¹•Ð ‰½¹™¥É´ˆ¤„ô‰a%P10A=M%Q%=9Lˆè(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ½¹™¥Éµ…Ñ¥½¸¥ÌÉ•ÅÕ¥É•ìÍ•¹ì‰½¹™¥É´ˆè‰a%P10A=M%Q%=9L‰ôœ°ÐÀÀ¤(€€€¥˜ÑÉÕÑ¡ä ‰5=MEU%Q=}9	1}M%5U1Q%=8ˆ¤…¹¹½Ð‰½‘ä¹•Ð ‰‰É½­•É}•á¥Ðˆ¤è(€€€€€€€ÑÉäè(€€€€€€€€€€€É•Á½ÉÐõÍ¥µÕ±…Ñ½È¹•á¥Ñ}…±° ¤í½µÁ±•Ñ•õ‰½½°¡É•Á½ÉÐ¹•Ð ‰½µÁ±•Ñ•ˆ±QÉÕ”¤¤íÍÑ…ÑÕÌô‰½µÁ±•Ñ•ˆ¥˜½µÁ±•Ñ••±Í”€‰Á…ÉÑ¥…±±å}‰±½­•ˆ(€€€€€€€€€€€µ•ÍÍ…”ô‰5½ÍÅÕ¥Ñ¼Í¥µÕ±…Ñ•Á½Í¥Ñ¥½¹ÌÝ•É”±½Í•ˆ¥˜½µÁ±•Ñ••±Í”€‰AÉ½™¥Ñ…‰±”Á½Í¥Ñ¥½¹ÌÝ•É”±½Í•ìÁ½Í¥Ñ¥½¹Ì‰•±½ÜÁÕÉ¡…Í”ÁÉ¥”É•µ…¥¸¡•±ˆ(€€€€€€€€€€€Ìõ±½…‘}ÍÑ…Ñ” ¤íÌ¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõ¹½Ð½µÁ±•Ñ•±•á¥Ñ}ÍÑ…ÑÕÌõÍÑ…ÑÕÌ±±…ÍÑ}•ÉÉ½Èõ9½¹”¤íÍ…Ù•}ÍÑ…Ñ”¡Ì¤í!¹±•…È ¤(€€€€€€€€€€€É•ÑÕÉ¸©Í½¹¥™ä¡½¬õ½µÁ±•Ñ•±ÉÕ¹¹¥¹œõ¹½Ð½µÁ±•Ñ•±•á•ÕÑ•õQÉÕ”±ÍÕ‰µ¥ÑÑ•õ…±Í”±½µÁ±•Ñ•õ½µÁ±•Ñ•±ÍÑ…ÑÕÌõÍÑ…ÑÕÌ±µ•ÍÍ…”õµ•ÍÍ…”±É••¹}É¥‰‰½¸õÉ•Á½ÉÐ±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤° ÈÀÀ¥˜½µÁ±•Ñ••±Í”€ÐÀä¤(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒé…ÁÀ¹±½•È¹Ý…É¹¥¹œ ‰Í¥µÕ±…Ñ¥½¸•á¥Ð™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤íÉ•ÑÕÉ¸•ÉÉ½È ‰M¥µÕ±…Ñ•Á½Í¥Ñ¥½¹Ì½Õ±¹½Ð‰”±½Í•ˆ°ÔÀÌ¤(€€€É•ÅÕ•ÍÑ}¥õÍÑÈ¡‰½‘ä¹•Ð ‰É•ÅÕ•ÍÑ}¥ˆ°ˆˆ¤¤¹ÍÑÉ¥À ¤(€€€¥˜±•¸¡É•ÅÕ•ÍÑ}¥¤øÄÈàéÉ•ÑÕÉ¸•ÉÉ½È ‰É•ÅÕ•ÍÑ}¥µÕÍÐ‰”€ÄÈà¡…É…Ñ•ÉÌ½È™•Ý•Èˆ¤(€€€¥˜É•ÅÕ•ÍÑ}¥è(€€€€€€€Ý¥Ñ 1=,è(€€€€€€€€€€€ÁÉ¥½Èõa%Q}IMU1QL¹•Ð¡É•ÅÕ•ÍÑ}¥¤(€€€€€€€¥˜ÁÉ¥½Èè(€€€€€€€€€€€¡ÑÑÁ}ÍÑ…ÑÕÌõÁÉ¥½Él‰¡ÑÑÁ}ÍÑ…ÑÕÌ‰t(€€€€€€€€€€€É•ÑÕÉ¸©Í½¹¥™ä¡í¬éØ™½È¬±Ø¥¸ÁÉ¥½È¹¥Ñ•µÌ ¤¥˜¬„ô‰¡ÑÑÁ}ÍÑ…ÑÕÌ‰ô¤±¡ÑÑÁ}ÍÑ…ÑÕÌ(€€€¥˜¹½Ða%Q}1=,¹…ÅÕ¥É”¡‰±½­¥¹œõ…±Í”¤è(€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰¸•á¥ÐÉ•ÅÕ•ÍÐ¥Ì…±É•…‘ä¥¸ÁÉ½É•ÍÌˆ°ÐÀä¤(€€€ÑÉäè(€€€€€€€Ìõ±½…‘}ÍÑ…Ñ” ¤íÌ¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõ…±Í”±•á¥Ñ}ÍÑ…ÑÕÌô‰É•ÅÕ•ÍÑ•ˆ±•á¥Ñ}É•ÅÕ•ÍÑ}¥õÉ•ÅÕ•ÍÑ}¥½È9½¹”±±…ÍÑ}•ÉÉ½Èõ9½¹”¤(€€€€€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€•á•ÁÐ=MÉÉ½È…Ì•áŒè(€€€€€€€€€€€…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤(€€€€€€€€€€€É•ÑÕÉ¸•ÉÉ½È ‰	½ÐÍÑ…Ñ”½Õ±¹½Ð‰”Í…Ù•ì¹¼‰É½­•ÈÉ•ÅÕ•ÍÐÝ…ÌÍ•¹Ðˆ°ÔÀÀ¤(€€€€€€€¥˜¹½Ð•¹…‰±• ¤è(€€€€€€€€€€€Ì¹ÕÁ‘…Ñ”¡•á¥Ñ}ÍÑ…ÑÕÌô‰‰±½­•ˆ±±…ÍÑ}•ÉÉ½Èô‰á¥ÐÝ…Ì¹½ÐÍÕ‰µ¥ÑÑ•‰•…ÕÍ”‰É½­•È•á•ÕÑ¥½¸¥Ì‘¥Í…‰±•ˆ¤(€€€€€€€€€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€€€€€•á•ÁÐ=MÉÉ½È…Ì•áŒé…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤(€€€€€€€€€€€É•ÑÕÉ¸©Í½¹¥™ä¡½¬õ…±Í”±ÉÕ¹¹¥¹œõ…±Í”±•á•ÕÑ•õ…±Í”±ÍÕ‰µ¥ÑÑ•õ…±Í”±½µÁ±•Ñ•õ…±Í”°(€€€€€€€€€€€€€€€ÍÑ…ÑÕÌô‰‰±½­•ˆ±µ•ÍÍ…”ô‰á¥ÐÝ…Ì¹½ÐÍÕ‰µ¥ÑÑ•‰•…ÕÍ”‰É½­•È•á•ÕÑ¥½¸¥Ì‘¥Í…‰±•ˆ±Ñ¥µ•ÍÑ…µÀõ¹½Ü ¤¤°ÐÀä(€€€€€€€‰É½­•Èõ±¥•¹Ð ¤ìÁ½Í¥Ñ¥½¹Ìõ‰É½­•È¹•Ñ}…±±}Á½Í¥Ñ¥½¹Ì ¤ìÉ½ÝÌõmtí™…¥±ÕÉ•Ìõmtí‰±½­•õmt(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹•¹ÕµÌ¥µÁ½ÉÐ=É‘•ÉM¥‘”±Q¥µ•%¹½É”(€€€€€€€™É½´…±Á…„¹ÑÉ…‘¥¹œ¹É•ÅÕ•ÍÑÌ¥µÁ½ÉÐ1¥µ¥Ñ=É‘•ÉI•ÅÕ•ÍÐ(€€€€€€€™½ÈÀ¥¸Á½Í¥Ñ¥½¹Ìè(€€€€€€€€€€€Íåµ‰½°õÍÑÈ¡•Ñ…ÑÑÈ¡À°‰Íåµ‰½°ˆ°ˆˆ¤¤íÅÑäõ¹Õµ‰•È¡•Ñ…ÑÑÈ¡À°‰ÅÑäˆ±9½¹”¤¤í•¹ÑÉäõ¹Õµ‰•È¡•Ñ…ÑÑÈ¡À°‰…Ù}•¹ÑÉå}ÁÉ¥”ˆ±9½¹”¤¤íÕÉÉ•¹Ðõ¹Õµ‰•È¡•Ñ…ÑÑÈ¡À°‰ÕÉÉ•¹Ñ}ÁÉ¥”ˆ±9½¹”¤¤(€€€€€€€€€€€¥˜¹½ÐÍåµ‰½°½ÈÅÑä¥Ì9½¹”½ÈÅÑäðôÀ½È•¹ÑÉä¥Ì9½¹”½ÈÕÉÉ•¹Ð¥Ì9½¹”è(€€€€€€€€€€€€€€€™…¥±ÕÉ•Ì¹…ÁÁ•¹¡ì‰Íåµ‰½°ˆéÍåµ‰½°½È€‰Õ¹­¹½Ý¸ˆ°‰É•…Í½¸ˆè‰Á½Í¥Ñ¥½¸‘…Ñ„Õ¹…Ù…¥±…‰±”‰ô¤í½¹Ñ¥¹Õ”(€€€€€€€€€€€Õ…ÉõÁÉ½Ñ•Ñ•‘}ÍÑ…Ñ”¡•¹ÑÉä±ÕÉÉ•¹Ð¤(€€€€€€€€€€€¥˜Õ…É‘l‰‰•±½Ý}•¹ÑÉä‰tè(€€€€€€€€€€€€€€€‰±½­•¹…ÁÁ•¹¡ì‰Íåµ‰½°ˆéÍåµ‰½°°‰ÅÑäˆéÅÑä°¨©Õ…É‘ô¤í½¹Ñ¥¹Õ”(€€€€€€€€€€€ÑÉäè(€€€€€€€€€€€€€€€½É‘•Èõ‰É½­•È¹ÍÕ‰µ¥Ñ}½É‘•È¡½É‘•É}‘…Ñ„õ1¥µ¥Ñ=É‘•ÉI•ÅÕ•ÍÐ¡Íåµ‰½°õÍåµ‰½°±ÅÑäõÅÑä±Í¥‘”õ=É‘•ÉM¥‘”¹M10±Ñ¥µ•}¥¹}™½É”õQ¥µ•%¹½É”¹d±±¥µ¥Ñ}ÁÉ¥”õÕ…É‘l‰ÁÉ½Ñ•Ñ•‘}™±½½È‰t±±¥•¹Ñ}½É‘•É}¥õ˜‰µ½ÍÅÕ¥Ñ¼µ•á¥ÐµíÍåµ‰½±ôµí¥¹Ð¡Ñ¥µ”¹Ñ¥µ” ¤¥ôˆ¤¤(€€€€€€€€€€€€€€€É½ÝÌ¹…ÁÁ•¹¡ì‰Íåµ‰½°ˆéÍåµ‰½°°‰ÅÑäˆéÅÑä°‰•¹ÑÉå}ÁÉ¥”ˆé•¹ÑÉä°‰ÕÉÉ•¹Ñ}ÁÉ¥”ˆéÕÉÉ•¹Ð°‰±¥µ¥Ñ}ÁÉ¥”ˆéÕ…É‘l‰ÁÉ½Ñ•Ñ•‘}™±½½È‰t°‰ÍÑ…ÑÕÌˆéÍ•É¥…°¡•Ñ…ÑÑÈ¡½É‘•È°‰ÍÑ…ÑÕÌˆ°‰…•ÁÑ•ˆ¤¤°‰½É‘•É}¥ˆéÍ•É¥…°¡•Ñ…ÑÑÈ¡½É‘•È°‰¥ˆ±9½¹”¤¤°‰É•…Í½¸ˆè‰=]9I}AI=QQ}a%P‰ô¤(€€€€€€€€€€€•á•ÁÐá•ÁÑ¥½¸è(€€€€€€€€€€€€€€€™…¥±ÕÉ•Ì¹…ÁÁ•¹¡ì‰Íåµ‰½°ˆéÍåµ‰½°°‰É•…Í½¸ˆè‰‰É½­•ÈÉ•©•Ñ•ÁÉ½Ñ•Ñ•±¥µ¥Ð½É‘•È‰ô¤(€€€€€€€ÍÑ…ÑÕÌô‰Á…ÉÑ¥…±}™…¥±ÕÉ”ˆ¥˜™…¥±ÕÉ•Ì•±Í”€‰Á…ÉÑ¥…±±å}‰±½­•ˆ¥˜‰±½­••±Í”€‰Á•¹‘¥¹œˆ(€€€€€€€µ•ÍÍ…”ô ‰M½µ”ÁÉ½Ñ•Ñ•±¥µ¥Ð½É‘•ÉÌÝ•É”É•©•Ñ•ìÙ•É¥™äÑ¡”É•µ…¥¹¥¹œÁ½Í¥Ñ¥½¹Ìˆ¥˜™…¥±ÕÉ•Ì•±Í”(€€€€€€€€€€€€‰AÉ½™¥Ñ…‰±”Á½Í¥Ñ¥½¹ÌÉ••¥Ù•ÁÉ½Ñ•Ñ•±¥µ¥Ð½É‘•ÉÌì‰•±½ÜµÁÕÉ¡…Í”Á½Í¥Ñ¥½¹ÌÉ•µ…¥¸¡•±ˆ¥˜‰±½­••±Í”(€€€€€€€€€€€€‰AÉ½Ñ•Ñ•±¥µ¥Ð½É‘•ÉÌÝ•É”…•ÁÑ•‰ä±Á…„…¹…É”Á•¹‘¥¹œì½µÁ±•Ñ¥½¸¡…Ì¹½Ð‰••¸Ù•É¥™¥•ˆ¤(€€€€€€€Ì¹ÕÁ‘…Ñ”¡•á¥Ñ}ÍÑ…ÑÕÌõÍÑ…ÑÕÌ±±…ÍÑ}•ÉÉ½Èõµ•ÍÍ…”¥˜™…¥±ÕÉ•Ì•±Í”9½¹”¤(€€€€€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€•á•ÁÐ=MÉÉ½È…Ì•áŒé…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”è€•Ìˆ±ÑåÁ”¡•áŒ¤¹}}¹…µ•}|¤(€€€€€€€Á…å±½…õì‰½¬ˆé¹½Ð™…¥±ÕÉ•Ì°‰ÉÕ¹¹¥¹œˆé…±Í”°‰•á•ÕÑ•ˆéQÉÕ”°‰ÍÕ‰µ¥ÑÑ•ˆéQÉÕ”°‰½µÁ±•Ñ•ˆé…±Í”°(€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆéÍÑ…ÑÕÌ°‰µ•ÍÍ…”ˆéµ•ÍÍ…”°‰É•ÍÕ±ÑÌˆéÉ½ÝÌ°‰™…¥±ÕÉ•Ìˆé™…¥±ÕÉ•Ì°‰‰±½­•‘}‰•±½Ý}ÁÕÉ¡…Í”ˆé‰±½­•°(€€€€€€€€€€€€‰µ½‘”ˆè‰Á…Á•Èˆ¥˜Á…Á•È ¤•±Í”€‰±¥Ù”ˆ°‰É•ÅÕ•ÍÑ}¥ˆéÉ•ÅÕ•ÍÑ}¥½È9½¹”°‰Ñ¥µ•ÍÑ…µÀˆé¹½Ü ¥ô(€€€€€€€¡ÑÑÁ}ÍÑ…ÑÕÌôÔÀÈ¥˜™…¥±ÕÉ•Ì•±Í”€ÐÀä¥˜‰±½­••±Í”€ÈÀÈ(€€€€€€€¥˜É•ÅÕ•ÍÑ}¥è(€€€€€€€€€€€Ý¥Ñ 1=,éa%Q}IMU1QMmÉ•ÅÕ•ÍÑ}¥‘tõì¨©Á…å±½…°‰¡ÑÑÁ}ÍÑ…ÑÕÌˆé¡ÑÑÁ}ÍÑ…ÑÕÍô(€€€€€€€Ý¥Ñ 1=,é!¹±•…È ¤(€€€€€€€É•ÑÕÉ¸©Í½¹¥™ä¡Á…å±½…¤±¡ÑÑÁ}ÍÑ…ÑÕÌ(€€€•á•ÁÐá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€Ìõ±½…‘}ÍÑ…Ñ” ¤íÌ¹ÕÁ‘…Ñ”¡ÉÕ¹¹¥¹œõ…±Í”±•á¥Ñ}ÍÑ…ÑÕÌô‰™…¥±•ˆ±±…ÍÑ}•ÉÉ½Èô‰	É½­•ÈÉ•©•Ñ•½È½Õ±¹½ÐÁÉ½•ÍÌÑ¡”•á¥ÐÉ•ÅÕ•ÍÐˆ¤(€€€€€€€ÑÉäéÍ…Ù•}ÍÑ…Ñ”¡Ì¤(€€€€€€€•á•ÁÐ=MÉÉ½È…ÌÍÑ…Ñ•}•áŒé…ÁÀ¹±½•È¹•ÉÉ½È ‰ÍÑ…Ñ”Á•ÉÍ¥ÍÑ•¹”™…¥±ÕÉ”…™Ñ•È‰É½­•È•ÉÉ½Èè€•Ìˆ±ÑåÁ”¡ÍÑ…Ñ•}•áŒ¤¹}}¹…µ•}|¤(€€€€€€€Ý¥Ñ 1=,é!¹±•…È ¤(€€€€€€€É•ÑÕÉ¸ÕÁÍÑÉ•…´¡•áŒ°‰•á¥Ñ}‰½Ðˆ¤(€€€™¥¹…±±äéa%Q}1=,¹É•±•…Í” ¤)¥˜}}¹…µ•}|ôô‰}}µ…¥¹}|ˆé…ÁÀ¹ÉÕ¸¡¡½ÍÐôˆÀ¸À¸À¸Àˆ±Á½ÉÐõ¥¹Ð¡½Ì¹•Ñ•¹Ø ‰A=IPˆ°ˆàÀàÀˆ¤¤¤
