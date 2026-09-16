@@ -8,7 +8,7 @@ import pandas as pd
 import yfinance as yf
 from strategy import build_watchlist
 
-PATH=Path(os.getenv("MOSQUITO_SIM_FILE","/tmp/mosquito-simulation.json"));LOCK=threading.RLock()
+PATH=Path(os.getenv("MOSQUITO_SIM_FILE","/tmp/mosquito-simulation.json"));LOCK=threading.RLock();BUILD_LOCK=threading.Lock()
 EMPTY={"active":False,"starting_value":0.0,"cash":0.0,"positions":[],"decision_at":None,"period":None,"rules_version":"V5.8 Master · reconstructed factors","rules_hash":"v58-reconstructed-2026-09","history":[]}
 
 def load():
@@ -38,6 +38,19 @@ def start(amount,count=50):
     each=amount/len(valid);positions=[{"symbol":p["ticker"],"qty":each/float(p["price"]),"entry_price":float(p["price"]),"entry_value":each,"rank":p["rank"],"score":p["score"]} for p in valid]
     data={**EMPTY,"active":True,"starting_value":amount,"cash":0.0,"positions":positions,"decision_at":result["generated_at"],"period":datetime.now(timezone.utc).strftime("%Y-%m"),"gate":"OPEN","history":[]};save(data);return data
 
+def begin(amount,count=50):
+    amount=float(amount);current=load()
+    if current.get("status")=="FORMING":return current
+    queued={**EMPTY,"active":True,"starting_value":amount,"cash":amount,"status":"FORMING","gate":"BUILDING","history":[]};save(queued)
+    def build():
+        if not BUILD_LOCK.acquire(blocking=False):return
+        try:start(amount,count)
+        except Exception:
+            failed=load();failed.update(active=False,status="UNAVAILABLE",gate="BUILD_FAILED",error="V5.8 market data was unavailable; press Start Bot to retry");save(failed)
+        finally:BUILD_LOCK.release()
+    threading.Thread(target=build,name="mosquito-simulation-builder",daemon=True).start()
+    return queued
+
 def stop():
     data=load();data["active"]=False;save(data);return data
 
@@ -55,7 +68,7 @@ def _closes(symbols):
 def value():
     data=load();positions=data.get("positions",[]);starting=float(data.get("starting_value") or 0);cash=float(data.get("cash") or 0)
     if not positions:
-        return {"status":"FORMING" if data.get("active") else "STOPPED","current_value":cash or starting,"starting_value":starting,"day_profit":0.0,"day_profit_pct":0.0,"ribbon_value":0.0,"ribbon_earned":False,"consecutive_green_closes":0,"eod_value":cash or starting,"eod_as_of":None,"positions_count":0,"rules_version":data["rules_version"],"rules_hash":data["rules_hash"],"gate":data.get("gate")}
+        return {"status":data.get("status") or ("FORMING" if data.get("active") else "STOPPED"),"current_value":cash or starting,"starting_value":starting,"day_profit":0.0,"day_profit_pct":0.0,"ribbon_value":0.0,"ribbon_earned":False,"consecutive_green_closes":0,"eod_value":cash or starting,"eod_as_of":None,"positions_count":0,"rules_version":data["rules_version"],"rules_hash":data["rules_hash"],"gate":data.get("gate"),"error":data.get("error")}
     close=_closes([p["symbol"] for p in positions])
     if close.empty:raise RuntimeError("Simulation prices are unavailable")
     qty={p["symbol"]:float(p["qty"]) for p in positions};daily=[]

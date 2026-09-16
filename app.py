@@ -272,7 +272,7 @@ def start():
     already=bool(s["running"]);s.update(running=True,allocation=allocation,last_error=None)
     simulation=None
     if truthy("MOSQUITO_ENABLE_SIMULATION"):
-        try:simulation=simulator.start(allocation)
+        try:simulation=simulator.begin(allocation)
         except Exception as exc:
             s.update(running=False,last_error="V5.8 paper simulation could not start");save_state(s);app.logger.warning("simulation start failure: %s",type(exc).__name__);return error("V5.8 paper simulation could not start",503)
     try:save_state(s)
