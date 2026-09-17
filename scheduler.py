@@ -214,7 +214,7 @@ class MarketScheduler:
                         "idempotency_key": key, "error_type": type(exc).__name__}
             state.update(status="completed", completed_session=session.key,
                          completed_at=self.now().isoformat())
-            state.pop("error_type", None)
+            state.pop("error_type", None); state.pop("pending_reason", None)
             self.store.save(state)
             return {"status": "completed", "session_date": session.key,
                     "idempotency_key": key, "result": result}
