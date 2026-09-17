@@ -22,7 +22,7 @@ broker boundary.
 ## Locked operating rules
 
 - AI, AI-infrastructure, and medical-AI public-stock universe
-- minimum three years of price history
+- most recent six months of completed price history (127 trading sessions)
 - top 50 preferred; top 25 research view
 - equal-weight allocation
 - prior-data-only ranking; no following-period lookahead
