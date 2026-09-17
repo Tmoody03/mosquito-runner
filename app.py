@@ -195,7 +195,8 @@ def tradable_picks(broker,count=50):
     candidates=[symbol for symbol in AI_UNIVERSE if symbol in tradable];close,volume,opened=alpaca_history(candidates);watch=rank_watchlist(close,volume,len(candidates),opened=opened,source="alpaca_daily_bars_full_universe")
     ranked=[dict(p) for p in watch.get("picks",[]) if p.get("ticker") in tradable]
     picks=screen_ranked(ranked,required=count)
-    if len(picks)<count:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available")
+    required=min(max(1,int(count)),50)
+    if len(picks)<required:raise RuntimeError(f"Only {len(picks)} eligible Alpaca-tradable V5.8 names were available; {required} are required")
     for rank,row in enumerate(picks,1):row.update(rank=rank,eligible=True)
     return picks
 
