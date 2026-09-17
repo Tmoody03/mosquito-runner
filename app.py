@@ -5,6 +5,7 @@ from collections import defaultdict,deque
 from datetime import date,datetime,timedelta,timezone
 from functools import wraps
 from pathlib import Path
+from urllib.request import Request as UrlRequest,urlopen
 from flask import Flask,jsonify,make_response,request,send_from_directory,redirect
 from strategy import AI_UNIVERSE,build_watchlist,rank_watchlist
 from fundamentals import screen_ranked
@@ -103,6 +104,15 @@ def broker_health_data():
         BROKER_HEALTH_CACHE=dict(result);BROKER_HEALTH_EXPIRES=time.monotonic()+ttl
         if future.done():BROKER_HEALTH_FUTURE=None
     return result
+def canonical_session_summary():
+    """Read-only bridge used by the public viewer; never forwards credentials."""
+    base=str(os.getenv("MOSQUITO_CANONICAL_PUBLIC_URL","")).rstrip("/")
+    if not base:return None
+    try:
+        with urlopen(UrlRequest(base+"/session-health",headers={"User-Agent":"MosquitoDashboard/1.0"}),timeout=8) as response:
+            value=json.loads(response.read().decode("utf-8"))
+            return value if isinstance(value,dict) and value.get("paper_mode") is True else None
+    except Exception:return None
 class PaperBrokerAdapter:
     paper=True
     def __init__(self,broker):self.broker=broker
@@ -574,7 +584,7 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;entry_pct=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"));payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":0.001 if entry_pct is None else entry_pct,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason"),"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
+    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;entry_pct=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"));scheduler_status=scheduler.get("status","waiting");payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":0.001 if entry_pct is None else entry_pct,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler_status,"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason") if scheduler_status=="waiting_entry_gate" else None,"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
     try:
         lifecycle=json.loads(Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")).read_text())
         payload["lifecycle_orders"]=len(lifecycle.get("orders") or {})
@@ -742,6 +752,12 @@ def dashboard_data():
     else:r["green_ribbon"]={"status":"DISABLED"}
     r["alerts"]=alerts_;r["alerts_count"]=len(alerts_)
     r["five_x"]=five_x.snapshot()
+    remote=canonical_session_summary()
+    if remote:
+        remote_x=remote.get("five_x") or {}
+        r["five_x"]={**r["five_x"],**remote_x,"positions_count":remote_x.get("positions",0)}
+        r["positions_count"]=remote.get("open_positions",r.get("positions_count"))
+        r["status"].update(running=bool(remote.get("running")),allocation=remote.get("allocation"),investment_amount=remote.get("allocation"))
     return jsonify(r)
 @app.post("/api/bot/start")
 @rate_limit()
