@@ -23,6 +23,10 @@ RESET_THREAD=None;RESET_THREAD_LOCK=threading.Lock()
 BROKER_HEALTH_LOCK=threading.Lock();BROKER_HEALTH_FUTURE=None;BROKER_HEALTH_CACHE=None;BROKER_HEALTH_EXPIRES=0.0
 BROKER_HEALTH_POOL=concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="broker-health")
 STATE_PATH=Path(os.getenv("MOSQUITO_STATE_FILE","/tmp/mosquito-runner-state.json"))
+ENTRY_CONFIRMATION_PATH=Path(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_FILE","/data/mosquito-entry-confirmations.json"))
+ENTRY_CONFIRMATION_SECONDS=300
+ENTRY_OBSERVATION_MAX_GAP_SECONDS=45
+ENTRY_QUOTE_MAX_AGE_SECONDS=60
 DEFAULTS={"allocation":0.0,"requested_investment":0.0,"baseline_equity":None,"selection_universe":[],"selection_session":None,"selected_watchlist":[],"last_qualified_count":None,"daily_goal":500.0,"running":False,"armed":True,"exit_status":None,"exit_request_id":None,"last_scan":None,"last_error":None,"updated_at":None}
 def now(): return datetime.now(timezone.utc).isoformat()
 def truthy(name): return os.getenv(name,"").lower() in {"1","true","yes","on"}
@@ -238,6 +242,36 @@ def entry_signal_met(session_open,current_price,threshold=0.001):
     """Return true only after a stock gains the required amount from today's open."""
     opened=number(session_open);current=number(current_price);threshold=number(threshold)
     return bool(opened and opened>0 and current and current>0 and threshold is not None and threshold>=0 and current>=opened*(1+threshold))
+def load_entry_confirmations():
+    with LOCK:
+        try:
+            value=json.loads(ENTRY_CONFIRMATION_PATH.read_text())
+            return value if isinstance(value,dict) else {}
+        except (OSError,ValueError):return {}
+def save_entry_confirmations(value):
+    with LOCK:
+        ENTRY_CONFIRMATION_PATH.parent.mkdir(parents=True,exist_ok=True)
+        fd,name=tempfile.mkstemp(prefix=".mosquito-entry-",dir=ENTRY_CONFIRMATION_PATH.parent)
+        try:
+            with os.fdopen(fd,"w") as handle:
+                json.dump(value,handle,separators=(",",":"),sort_keys=True);handle.flush();os.fsync(handle.fileno())
+            os.replace(name,ENTRY_CONFIRMATION_PATH)
+        finally:
+            try:os.unlink(name)
+            except FileNotFoundError:pass
+def entry_confirmation_summary():
+    state=load_entry_confirmations();now_utc=datetime.now(timezone.utc);active=0;ready=0
+    for record in state.values():
+        try:
+            started=datetime.fromisoformat(str(record.get("started_at")).replace("Z","+00:00"))
+            last_seen=datetime.fromisoformat(str(record.get("last_seen")).replace("Z","+00:00"))
+            if started.tzinfo is None:started=started.replace(tzinfo=timezone.utc)
+            if last_seen.tzinfo is None:last_seen=last_seen.replace(tzinfo=timezone.utc)
+            if (now_utc-last_seen.astimezone(timezone.utc)).total_seconds()>ENTRY_OBSERVATION_MAX_GAP_SECONDS:continue
+            active+=1
+            if (now_utc-started.astimezone(timezone.utc)).total_seconds()>=ENTRY_CONFIRMATION_SECONDS:ready+=1
+        except (TypeError,ValueError):continue
+    return {"window_seconds":ENTRY_CONFIRMATION_SECONDS,"active":active,"ready":ready}
 def confirmed_entry_picks(picks):
     """Fail-closed live Alpaca gate for new buys; stale/missing snapshots never qualify."""
     from alpaca.data.enums import DataFeed
@@ -246,7 +280,7 @@ def confirmed_entry_picks(picks):
     key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
     market=StockHistoricalDataClient(key,secret);threshold=effective_entry_threshold()
     rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
-    symbols=list(rows)
+    symbols=list(rows);confirmations=load_entry_confirmations();observed=set()
     def snapshots_for(batch):
         """Isolate a bad/unavailable symbol instead of blocking the other 49."""
         try:
@@ -272,11 +306,30 @@ def confirmed_entry_picks(picks):
             ask=number(getattr(quote,"ask_price",None));bid=number(getattr(quote,"bid_price",None))
             current=ask or (number(getattr(trade,"price",None))) or number(getattr(minute,"close",None))
             stamp=(getattr(quote,"timestamp",None) if ask else None) or getattr(trade,"timestamp",None) or getattr(minute,"timestamp",None)
-            if stamp is None:continue
+            observed.add(symbol)
+            if stamp is None:
+                confirmations.pop(symbol,None);continue
             if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
-            if utc_now-stamp.astimezone(timezone.utc)>timedelta(minutes=5):continue
-            if not entry_signal_met(opened,current,threshold):continue
-            row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True,entry_price_source=("ask" if ask else "last_trade"));qualified.append(row)
+            if (utc_now-stamp.astimezone(timezone.utc)).total_seconds()>ENTRY_QUOTE_MAX_AGE_SECONDS:
+                confirmations.pop(symbol,None);continue
+            if not entry_signal_met(opened,current,threshold):
+                confirmations.pop(symbol,None);continue
+            previous=confirmations.get(symbol) if isinstance(confirmations.get(symbol),dict) else {}
+            reset=(number(previous.get("session_open"))!=opened or number(previous.get("threshold"))!=threshold)
+            try:
+                last_seen=datetime.fromisoformat(str(previous.get("last_seen")).replace("Z","+00:00"))
+                if last_seen.tzinfo is None:last_seen=last_seen.replace(tzinfo=timezone.utc)
+                if (utc_now-last_seen.astimezone(timezone.utc)).total_seconds()>ENTRY_OBSERVATION_MAX_GAP_SECONDS:reset=True
+            except (TypeError,ValueError):reset=True
+            started_at=utc_now if reset else datetime.fromisoformat(str(previous["started_at"]).replace("Z","+00:00"))
+            if started_at.tzinfo is None:started_at=started_at.replace(tzinfo=timezone.utc)
+            held_seconds=max(0,(utc_now-started_at.astimezone(timezone.utc)).total_seconds())
+            confirmations[symbol]={"started_at":started_at.astimezone(timezone.utc).isoformat(),"last_seen":utc_now.isoformat(),"session_open":opened,"threshold":threshold,"latest_price":current}
+            if held_seconds<ENTRY_CONFIRMATION_SECONDS:continue
+            row=rows[symbol];row.update(price=current,session_open=opened,entry_signal_pct=(current/opened-1)*100,entry_confirmed=True,entry_confirmation_seconds=round(held_seconds,1),entry_confirmation_required_seconds=ENTRY_CONFIRMATION_SECONDS,entry_price_source=("ask" if ask else "last_trade"));qualified.append(row)
+    for symbol in list(confirmations):
+        if symbol not in rows or symbol not in observed:confirmations.pop(symbol,None)
+    save_entry_confirmations(confirmations)
     if qualified:
         ordered=sorted(qualified,key=lambda row:float(row.get("entry_signal_pct",0)))
         denom=max(1,len(ordered)-1);strength={str(row.get("ticker")):index/denom for index,row in enumerate(ordered)}
@@ -588,7 +641,7 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;scheduler_status=scheduler.get("status","waiting");payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":effective_entry_threshold(),"trailing_drop_pct":0.05,"below_entry_exit":False,"below_entry_sell_blocked":True,"scheduler_status":scheduler_status,"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason") if scheduler_status=="waiting_entry_gate" else None,"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
+    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;scheduler_status=scheduler.get("status","waiting");payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":effective_entry_threshold(),"entry_confirmation_grace_seconds":ENTRY_CONFIRMATION_SECONDS,"entry_confirmation":entry_confirmation_summary(),"trailing_drop_pct":0.05,"below_entry_exit":False,"below_entry_sell_blocked":True,"scheduler_status":scheduler_status,"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason") if scheduler_status=="waiting_entry_gate" else None,"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
     try:
         account_summary=account_data()
         payload["strategy_current_value"]=account_summary.get("equity")
