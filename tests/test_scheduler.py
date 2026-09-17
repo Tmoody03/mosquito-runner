@@ -39,6 +39,21 @@ def test_waits_until_0950_eastern_then_runs_once_and_survives_restart(tmp_path):
     assert len(calls) == 1
 
 
+def test_preflight_runs_once_at_0930_and_entry_waits_until_0950(tmp_path):
+    day=date(2026,9,17);calls=[];preflights=[]
+    def make(at):
+        return MarketScheduler(lambda:clock(at),lambda **_:[session(day)],lambda **kw:calls.append(kw),
+            state_path=tmp_path/"two-phase.json",preflight=lambda **kw:preflights.append(kw) or {"locked":True})
+    opened=datetime(2026,9,17,9,30,tzinfo=ET)
+    result=make(opened).tick()
+    assert result["status"]=="waiting" and result["preflight_complete"] is True
+    assert preflights==[{"session_date":"2026-09-17","paper_only":True}] and calls==[]
+    assert make(datetime(2026,9,17,9,49,tzinfo=ET)).tick()["status"]=="waiting"
+    assert len(preflights)==1 and calls==[]
+    assert make(datetime(2026,9,17,9,50,tzinfo=ET)).tick()["status"]=="completed"
+    assert len(calls)==1
+
+
 def test_restart_after_missed_open_recovers_during_session(tmp_path):
     calls = []
     day = date(2026, 9, 17)

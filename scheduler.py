@@ -122,6 +122,7 @@ class MarketScheduler:
         paper_only: bool = True,
         now: Callable[[], datetime] | None = None,
         start_delay: timedelta = timedelta(minutes=20),
+        preflight: Callable[..., object] | None = None,
     ):
         if not paper_only:
             raise ValueError("MarketScheduler is hard-locked to paper-only operation")
@@ -131,6 +132,7 @@ class MarketScheduler:
         self.store = JsonRunStore(state_path)
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.start_delay = start_delay
+        self.preflight = preflight
         if self.start_delay < timedelta(0):
             raise ValueError("start_delay cannot be negative")
         self._tick_lock = threading.Lock()
@@ -165,9 +167,23 @@ class MarketScheduler:
             # The calendar supplies the DST-correct opening instant.  Clock state is
             # authoritative during exceptional halts/closures.
             starts_at = session.opens_at + self.start_delay
+            state = self.store.load()
+            if current >= session.opens_at and self.preflight and state.get("preflight_session") != session.key:
+                try:
+                    preflight_result = self.preflight(session_date=session.key, paper_only=True)
+                except Exception as exc:
+                    state.update(status="preflight_failed", session_date=session.key,
+                                 error_type=type(exc).__name__, failed_at=self.now().isoformat())
+                    self.store.save(state)
+                    return {"status": "preflight_failed", "session_date": session.key,
+                            "error_type": type(exc).__name__}
+                state.update(preflight_session=session.key, preflight_at=current.isoformat(),
+                             preflight_result=preflight_result, status="waiting_for_entry")
+                state.pop("error_type", None); self.store.save(state)
             if current < starts_at:
                 return {"status": "waiting", "opens_at": session.opens_at.isoformat(),
-                        "starts_at": starts_at.isoformat()}
+                        "starts_at": starts_at.isoformat(),
+                        "preflight_complete": state.get("preflight_session") == session.key}
             if current > session.closes_at or not bool(_field(clock, "is_open", False)):
                 return {"status": "closed", "reason": "market_not_open"}
 

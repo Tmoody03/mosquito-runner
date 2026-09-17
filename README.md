@@ -6,6 +6,22 @@ paper-account trailing monitor.
 Mosquito is hard-locked to Alpaca paper mode in the application code. There is
 no supported live-trading mode in this build.
 
+## Standard / 5X daily faceoff
+
+The market scheduler has two explicit phases based on Alpaca's official
+calendar: research and connection preflight begins at 09:30 America/New_York,
+and entries are prohibited until 09:50. Standard V5.8 remains a 50-position
+Alpaca paper portfolio. The separate 5X Candidate Model screens the complete
+active Alpaca US-equity inventory and runs in an isolated seven-position
+virtual-paper ledger. It is brokerless because Alpaca nets two strategies'
+shares inside one account; isolation prevents either engine from selling or
+resetting the other's position.
+
+The 5X label is a speculative twelve-month research target, not a promise of a
+400% gain. Liquidity and six-month price-history gates are applied before the
+existing fail-closed SEC balance-sheet/backlog gate. If fewer than seven names
+pass, the unused allocation remains cash.
+
 The pure `build_shadow_watchlist` function in `reversal_strategy.py` is an
 isolated, non-executable research screen. It accepts caller-supplied daily
 open/close bars, ignores observations on or after `trade_date`, returns at most

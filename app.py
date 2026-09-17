@@ -10,6 +10,7 @@ from strategy import AI_UNIVERSE,build_watchlist,rank_watchlist
 from fundamentals import screen_ranked
 import simulator
 import engine
+import five_x
 from protection import protected_state
 from lifecycle import Lifecycle
 from scheduler import MarketScheduler,RetryPending
@@ -59,6 +60,8 @@ def engine_loop():
                 broker=client()
                 if paper_trade_window_open(broker):
                     life=lifecycle_for(broker);life.reconcile();engine.cycle(broker,submit_enabled=enabled());reconcile_closed_positions(broker,life);scan_reentry_watchlist(broker,life)
+                    symbols=list((five_x.load().get("positions") or {}).keys())
+                    if symbols:five_x.mark(fresh_quotes(symbols))
         except Exception as exc:log_broker_error(exc,"trailing_engine_cycle")
         if RUNTIME_STOP.wait(max(2,number(os.getenv("MOSQUITO_ENGINE_INTERVAL")) or 5)):break
 def ensure_engine():
@@ -268,7 +271,7 @@ def confirmed_entry_picks(picks):
         qualified.sort(key=lambda row:(-float(row.get("live_score",0)),row.get("rank",10**9)))
         for index,row in enumerate(qualified,1):row["intraday_rank"]=index
     return qualified
-def alpaca_history(symbols):
+def alpaca_history(symbols,batch_size=20):
     import pandas as pd
     from alpaca.data.enums import DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
@@ -276,8 +279,8 @@ def alpaca_history(symbols):
     from alpaca.data.timeframe import TimeFrame
     key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
     market=StockHistoricalDataClient(key,secret);opens=[];closes=[];volumes=[];start=datetime.now(timezone.utc)-timedelta(days=220)
-    for offset in range(0,len(symbols),20):
-        batch=symbols[offset:offset+20];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
+    for offset in range(0,len(symbols),batch_size):
+        batch=symbols[offset:offset+batch_size];bars=market.get_stock_bars(StockBarsRequest(symbol_or_symbols=batch,start=start,timeframe=TimeFrame.Day,feed=feed));frame=bars.df
         if frame is None or frame.empty:continue
         if isinstance(frame.index,pd.MultiIndex):
             opens.append(frame["open"].unstack(level="symbol"));closes.append(frame["close"].unstack(level="symbol"));volumes.append(frame["volume"].unstack(level="symbol"))
@@ -285,6 +288,58 @@ def alpaca_history(symbols):
     close=pd.concat(closes,axis=1).sort_index();volume=pd.concat(volumes,axis=1).reindex(close.index);opened=pd.concat(opens,axis=1).reindex(close.index)
     close.columns=[str(c).upper() for c in close.columns];volume.columns=[str(c).upper() for c in volume.columns];opened.columns=[str(c).upper() for c in opened.columns]
     return close.loc[:,~close.columns.duplicated()],volume.loc[:,~volume.columns.duplicated()],opened.loc[:,~opened.columns.duplicated()]
+
+def fresh_quotes(symbols):
+    """Return fresh executable paper asks, falling back to a fresh last trade."""
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockSnapshotRequest
+    key,secret=credentials();feed=DataFeed.SIP if os.getenv("ALPACA_DATA_FEED","iex").lower()=="sip" else DataFeed.IEX
+    market=StockHistoricalDataClient(key,secret);out={};checked=datetime.now(timezone.utc)
+    for offset in range(0,len(symbols),50):
+        snapshots=market.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols[offset:offset+50],feed=feed)) or {}
+        for symbol,snap in snapshots.items():
+            quote=getattr(snap,"latest_quote",None);trade=getattr(snap,"latest_trade",None)
+            price=number(getattr(quote,"ask_price",None)) or number(getattr(trade,"price",None))
+            stamp=getattr(quote,"timestamp",None) or getattr(trade,"timestamp",None)
+            if not price or stamp is None:continue
+            if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
+            if checked-stamp.astimezone(timezone.utc)<=timedelta(minutes=5):out[str(symbol).upper()]=price
+    return out
+
+def five_x_market_picks(broker):
+    """Screen Alpaca's complete active US-equity inventory, then fail closed."""
+    from alpaca.trading.enums import AssetClass,AssetStatus
+    from alpaca.trading.requests import GetAssetsRequest
+    assets=broker.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,asset_class=AssetClass.US_EQUITY))
+    excluded=(" ETF"," ETN"," WARRANT"," WTS"," UNIT"," RIGHT"," PREFERRED"," ACQUISITION CORP")
+    symbols=[]
+    for asset in assets:
+        symbol=str(getattr(asset,"symbol","")).upper();name=" "+str(getattr(asset,"name","")).upper()
+        exchange=str(getattr(getattr(asset,"exchange",None),"value",getattr(asset,"exchange",""))).upper()
+        if (symbol and bool(getattr(asset,"tradable",False)) and bool(getattr(asset,"fractionable",False)) and
+            exchange in {"NASDAQ","NYSE","AMEX","ARCA"} and not any(term in name for term in excluded) and
+            not re.search(r"(?:[.\-/](?:P|PR)|[WU]$)",symbol)):
+            symbols.append(symbol)
+    close,volume,_opened=alpaca_history(sorted(set(symbols)),batch_size=200)
+    ranked=five_x.rank_market(close,volume,count=60)
+    passed=screen_ranked(ranked,required=five_x.POSITION_COUNT)
+    for rank,row in enumerate(passed,1):row.update(rank=rank,eligible=True)
+    return passed,{"assets_examined":len(assets),"common_stock_candidates":len(symbols),"bar_eligible":len(ranked)}
+
+def preflight_open(*,session_date,paper_only):
+    """09:30 ET research lock; broker submissions remain forbidden until 09:50."""
+    if not paper_only or not paper():raise RuntimeError("paper-only preflight required")
+    broker=client();saved=load_state();allocation=number(saved.get("requested_investment")) or 50000.0
+    if saved.get("selection_session")!=session_date:
+        pool=[{k:row.get(k) for k in ("ticker","rank","score","price","category","eligible","fundamental_gate","fundamentals")} for row in tradable_picks(broker,len(AI_UNIVERSE))]
+        saved.update(selection_universe=pool,selection_session=session_date,selected_watchlist=pool[:50],last_qualified_count=len(pool),last_scan=now(),last_error=None,running=True,armed=True,allocation=allocation,requested_investment=allocation);save_state(saved)
+    five_error=None;stats={}
+    try:
+        picks,stats=five_x_market_picks(broker);five_x.lock_selection(session_date,picks,number(os.getenv("MOSQUITO_5X_ALLOCATION")) or 50000.0)
+    except Exception as exc:
+        five_error=type(exc).__name__;state=five_x.load();state.update(status="preflight_failed",last_error=five_error,updated_at=now());five_x.save(state)
+    return {"standard_selected":len(load_state().get("selected_watchlist") or []),"five_x_selected":len(five_x.load().get("selected") or []),"five_x_error_type":five_error,**stats}
 def orchestrate_open(*,session_date,idempotency_key,paper_only):
     if not paper_only or not paper():raise RuntimeError("paper-only launch required")
     state=load_state()
@@ -328,10 +383,17 @@ def orchestrate_open(*,session_date,idempotency_key,paper_only):
         result=life.rebalance(confirmed,prices,bp,dead_symbols=dead)
     state.update(running=True,armed=True,allocation=allocation,requested_investment=requested,last_scan=now(),last_error=None);save_state(state);ensure_engine()
     return {"session_date":session_date,"idempotency_key":idempotency_key,"selected":50,"eligible_candidates":len(picks),"orders":len(result.get("orders",{})),"allocation":allocation,"paper_only":True}
+def orchestrate_session(*,session_date,idempotency_key,paper_only):
+    """09:50 ET entry phase for both isolated paper tests."""
+    selected=five_x.load().get("selected") or []
+    if selected:
+        five_x.buy_locked(session_date,fresh_quotes([row["ticker"] for row in selected]))
+    standard=orchestrate_open(session_date=session_date,idempotency_key=idempotency_key,paper_only=paper_only)
+    return {"standard":standard,"five_x":{"status":five_x.load().get("status"),"positions":len(five_x.load().get("positions") or {})},"paper_only":True}
 def broker_calendar(*,start,end):
     from alpaca.trading.requests import GetCalendarRequest
     return client().get_calendar(GetCalendarRequest(start=date.fromisoformat(start),end=date.fromisoformat(end)))
-def scheduler_instance():return MarketScheduler(lambda:client().get_clock(),broker_calendar,orchestrate_open,state_path=os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"),paper_only=True,start_delay=timedelta(minutes=max(0,number(os.getenv("MOSQUITO_START_DELAY_MINUTES")) or 20)))
+def scheduler_instance():return MarketScheduler(lambda:client().get_clock(),broker_calendar,orchestrate_session,state_path=os.getenv("MOSQUITO_SCHEDULER_FILE","/data/mosquito-scheduler.json"),paper_only=True,start_delay=timedelta(minutes=max(0,number(os.getenv("MOSQUITO_START_DELAY_MINUTES")) or 20)),preflight=preflight_open)
 def ensure_scheduler():
     global SCHEDULER_THREAD
     with SCHEDULER_THREAD_LOCK:
@@ -497,7 +559,8 @@ def assets(name):
 def health():return jsonify(status="ok",service="mosquito-runner",timestamp=now())
 @app.get("/ready")
 def ready():
-    k,s=credentials();return jsonify(status="ready",alpaca_configured=bool(k and s),state_writable=os.access(STATE_PATH.parent,os.W_OK),timestamp=now())
+    k,s=credentials();saved=load_state();writable=os.access(STATE_PATH.parent,os.W_OK)
+    return jsonify(status="ready" if writable else "not_ready",alpaca_configured=bool(k and s),state_writable=writable,allocation=saved.get("requested_investment"),allocation_ready=(number(saved.get("requested_investment")) or 0)>0,paper_mode=True,execution_service=enabled(),scheduler_wake_eastern="09:30",entry_eastern="09:50",timestamp=now()),(200 if writable else 503)
 @app.get("/broker-health")
 def broker_health():
     result=broker_health_data();return jsonify(result),(200 if result["status"]=="ok" else 503)
@@ -510,7 +573,7 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason"),"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":result.get("eligible_candidates"),"submitted_orders":result.get("orders"),"timestamp":now()}
+    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT")) or 0.001,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler.get("status","waiting"),"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason"),"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
     try:
         lifecycle=json.loads(Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")).read_text())
         payload["lifecycle_orders"]=len(lifecycle.get("orders") or {})
@@ -610,7 +673,7 @@ def scan():
     except Exception as exc:
         s=load_state();s["last_error"]="Market scan unavailable";save_state(s);app.logger.warning("scan failure: %s",type(exc).__name__);return error("Market scan is temporarily unavailable",503)
 def status_data():
-    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"allocation":st["allocation"],"investment_amount":st["requested_investment"],"daily_goal":st["daily_goal"],"scheduled_start_eastern":"09:50","exit_status":st["exit_status"],"exit_request_id":st["exit_request_id"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode · protected sell floor at filled purchase price" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
+    k,s=credentials();st=load_state();return {"name":"Mosquito AI Trading Bot","strategy":"V5.8 Master + 5X Candidate Model","running":bool(st["running"]),"mode":"paper" if paper() else "live","alpaca_configured":bool(k and s),"order_execution":enabled(),"order_execution_enabled":enabled(),"viewer_only":not enabled(),"allocation":st["allocation"],"investment_amount":st["requested_investment"],"five_x_allocation":five_x.load().get("allocation") or 50000.0,"daily_goal":st["daily_goal"],"scheduled_wake_eastern":"09:30","scheduled_start_eastern":"09:50","exit_status":st["exit_status"],"exit_request_id":st["exit_request_id"],"risk_status":"SAFE" if paper() else "LIVE","risk_detail":"Paper trading mode · protected sell floor at filled purchase price" if paper() else "Live execution enabled","last_scan":st["last_scan"],"last_error":st["last_error"],"timestamp":now()}
 @app.get("/api/status")
 def status():return jsonify(status_data())
 @app.get("/api/alerts")
@@ -677,6 +740,7 @@ def dashboard_data():
         except Exception:r["green_ribbon"]={"status":"UNAVAILABLE","error":"Paper simulation prices are temporarily unavailable"};r["errors"].append("green_ribbon")
     else:r["green_ribbon"]={"status":"DISABLED"}
     r["alerts"]=alerts_;r["alerts_count"]=len(alerts_)
+    r["five_x"]=five_x.snapshot()
     return jsonify(r)
 @app.post("/api/bot/start")
 @rate_limit()
