@@ -228,6 +228,12 @@ def qualifying_universe_picks(broker, limit=50, ranked=None):
     """
     ranked = ranked or tradable_picks(broker, 50)
     return confirmed_entry_picks(ranked)[:max(1, min(int(limit), 50))]
+def effective_entry_threshold():
+    """Enforce Mosquito's +0.10% minimum entry confirmation fail-closed."""
+    configured=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"))
+    if configured is None:configured=0.001
+    if configured<0 or configured>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
+    return max(0.001,configured)
 def entry_signal_met(session_open,current_price,threshold=0.001):
     """Return true only after a stock gains the required amount from today's open."""
     opened=number(session_open);current=number(current_price);threshold=number(threshold)
@@ -238,9 +244,7 @@ def confirmed_entry_picks(picks):
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockSnapshotRequest
     key,secret=credentials();feed_name=os.getenv("ALPACA_DATA_FEED","iex").lower();feed=DataFeed.SIP if feed_name=="sip" else DataFeed.IEX
-    market=StockHistoricalDataClient(key,secret);threshold=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"))
-    if threshold is None:threshold=0.001
-    if threshold<0 or threshold>0.10:raise RuntimeError("entry confirmation threshold is outside the safe range")
+    market=StockHistoricalDataClient(key,secret);threshold=effective_entry_threshold()
     rows={str(row.get("ticker") or "").upper():dict(row) for row in picks};qualified=[];utc_now=datetime.now(timezone.utc)
     symbols=list(rows)
     def snapshots_for(batch):
@@ -584,7 +588,14 @@ def session_health():
     try:scheduler=json.loads(scheduler_path.read_text())
     except (OSError,ValueError):scheduler={}
     result=scheduler.get("result") if isinstance(scheduler.get("result"),dict) else {}
-    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;entry_pct=number(os.getenv("MOSQUITO_ENTRY_CONFIRMATION_PCT"));scheduler_status=scheduler.get("status","waiting");payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":0.001 if entry_pct is None else entry_pct,"trailing_drop_pct":0.05,"below_entry_exit":True,"scheduler_status":scheduler_status,"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason") if scheduler_status=="waiting_entry_gate" else None,"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
+    saved=load_state();x=five_x.snapshot();standard_result=result.get("standard") if isinstance(result.get("standard"),dict) else result;scheduler_status=scheduler.get("status","waiting");payload={"status":"ok","paper_mode":paper(),"allocation":saved.get("requested_investment"),"running":saved.get("running"),"execution_service":enabled(),"scheduler_wake_eastern":"09:30","entry_eastern":"09:50","entry_confirmation_pct":effective_entry_threshold(),"trailing_drop_pct":0.05,"below_entry_exit":False,"below_entry_sell_blocked":True,"scheduler_status":scheduler_status,"scheduler_session":scheduler.get("session_date"),"preflight_session":scheduler.get("preflight_session"),"scheduler_error_type":scheduler.get("error_type"),"pending_reason":scheduler.get("pending_reason") if scheduler_status=="waiting_entry_gate" else None,"selected":len(saved.get("selected_watchlist") or []),"qualified_today":saved.get("last_qualified_count"),"eligible_candidates":standard_result.get("eligible_candidates"),"submitted_orders":standard_result.get("orders"),"five_x":{"status":x.get("status"),"allocation":x.get("allocation"),"selected":len(x.get("selected") or []),"positions":x.get("positions_count"),"current_value":x.get("current_value"),"return_pct":x.get("return_pct"),"last_error":x.get("last_error")},"timestamp":now()}
+    try:
+        account_summary=account_data()
+        payload["strategy_current_value"]=account_summary.get("equity")
+        payload["strategy_profit"]=account_summary.get("total_profit")
+        payload["strategy_return_pct"]=account_summary.get("total_profit_pct")
+    except Exception:
+        payload.update(strategy_current_value=None,strategy_profit=None,strategy_return_pct=None)
     try:
         lifecycle=json.loads(Path(os.getenv("MOSQUITO_LIFECYCLE_FILE","/data/mosquito-lifecycle.json")).read_text())
         payload["lifecycle_orders"]=len(lifecycle.get("orders") or {})
@@ -758,6 +769,9 @@ def dashboard_data():
         r["five_x"]={**r["five_x"],**remote_x,"positions_count":remote_x.get("positions",0)}
         r["positions_count"]=remote.get("open_positions",r.get("positions_count"))
         r["status"].update(running=bool(remote.get("running")),allocation=remote.get("allocation"),investment_amount=remote.get("allocation"))
+        if remote.get("strategy_current_value") is not None:
+            if not isinstance(r.get("account"),dict):r["account"]={}
+            r["account"].update(equity=remote.get("strategy_current_value"),portfolio_value=remote.get("strategy_current_value"),day_profit=remote.get("strategy_profit"),day_profit_pct=remote.get("strategy_return_pct"),total_profit=remote.get("strategy_profit"),total_profit_pct=remote.get("strategy_return_pct"))
     return jsonify(r)
 @app.post("/api/bot/start")
 @rate_limit()
