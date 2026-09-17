@@ -6,6 +6,19 @@ paper-account trailing monitor.
 Mosquito is hard-locked to Alpaca paper mode in the application code. There is
 no supported live-trading mode in this build.
 
+The pure `build_shadow_watchlist` function in `reversal_strategy.py` is an
+isolated, non-executable research screen. It accepts caller-supplied daily
+open/close bars, ignores observations on or after `trade_date`, returns at most
+25 audited picks, and has no connection to the broker lifecycle or V5.8 order
+path.
+
+V5.8's ranked output exposes `base_score`, `reversal_match`, the four
+`reversal_metrics`, `reversal_overlay_score`, and
+`reversal_score_contribution`. The reversal equation is a 10% soft overlay
+calculated only from completed sessions before the
+trade date. It does not bypass the SEC fundamentals gate or the paper-only
+broker boundary.
+
 ## Locked operating rules
 
 - AI, AI-infrastructure, and medical-AI public-stock universe

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -16,8 +17,10 @@ AI_UNIVERSE_BY_CATEGORY = {
     "medical_healthcare_ai": """ABT ABBV ALNY AMGN BDX BMY BSX CAH CI CNC CVS DXCM EW GILD HCA HOLX HUM IDXX ILMN INCY ISRG JNJ LH LLY MDT MRNA MRK NTRA PFE REGN RMD RPRX SYK TMO UNH VEEV VRTX WAT ZBH ZTS GH EXAS PACB RXRX SDGR CERT DOCS HIMS OSCR TDOC DHR IQV TECH CRL A WST COO PODD MASI PEN ALGN STE GEHC PHG NVS AZN SNY TAK BGNE BMRN BIIB NBIX IONS QDEL DGX ELV MOH HQY RGEN RVTY OPCH""".split(),
 }
 AI_UNIVERSE = sorted({ticker for tickers in AI_UNIVERSE_BY_CATEGORY.values() for ticker in tickers})
-MIN_HISTORY_DAYS = 110
+MIN_HISTORY_DAYS = 127
 DOWNLOAD_BATCH_SIZE = 80
+REVERSAL_WEIGHT = 0.10
+REVERSAL_LOOKBACK = 126
 
 
 def _feature_frame(close, volume):
@@ -59,24 +62,31 @@ def _extract_field(data, field, requested):
 
 
 def _download_universe(tickers):
-    closes, volumes = [], []
+    opens, closes, volumes = [], [], []
     for start in range(0, len(tickers), DOWNLOAD_BATCH_SIZE):
         batch = tickers[start:start + DOWNLOAD_BATCH_SIZE]
         try:
-            data = yf.download(batch, period="6mo", interval="1d", auto_adjust=True,
+            # Fetch extra calendar history so 127 completed sessions remain
+            # available after weekends, holidays, and exclusion of today's bar.
+            # The actual return metric remains exactly 126 trading sessions.
+            data = yf.download(batch, period="8mo", interval="1d", auto_adjust=True,
                                progress=False, group_by="column", threads=True)
         except Exception:
             continue
         close = _extract_field(data, "Close", batch)
+        opened = _extract_field(data, "Open", batch)
         volume = _extract_field(data, "Volume", batch)
         common = close.columns.intersection(volume.columns)
         if len(common):
             closes.append(close[common]); volumes.append(volume[common])
+            opens.append(opened[common.intersection(opened.columns)])
     if not closes:
         raise RuntimeError("Market data is temporarily unavailable")
     close = pd.concat(closes, axis=1).sort_index()
     volume = pd.concat(volumes, axis=1).reindex(close.index)
-    return close.loc[:, ~close.columns.duplicated()], volume.loc[:, ~volume.columns.duplicated()]
+    opened = pd.concat(opens, axis=1).reindex(close.index) if opens else pd.DataFrame(index=close.index)
+    return (close.loc[:, ~close.columns.duplicated()], volume.loc[:, ~volume.columns.duplicated()],
+            opened.loc[:, ~opened.columns.duplicated()])
 
 
 def _category_for(ticker):
@@ -84,9 +94,44 @@ def _category_for(ticker):
                  if ticker in tickers), "other")
 
 
-def rank_watchlist(close,volume,count=50,*,source="provided_market_data"):
+def _reversal_frame(opened, close):
+    """Return the auditable prior-session reversal equation for each symbol."""
+    result = pd.DataFrame(index=close.columns, data={
+        "reversal_six_month_return": np.nan, "reversal_five_day_return": np.nan,
+        "reversal_prior_session_return": np.nan, "reversal_prior_day_gap": np.nan,
+        "reversal_signal": False,
+    })
+    if opened is None or close.shape[0] < REVERSAL_LOOKBACK + 1:
+        return result
+    opened = opened.reindex(index=close.index, columns=close.columns)
+    latest, prior = close.iloc[-1], close.iloc[-2]
+    result["reversal_six_month_return"] = latest / close.iloc[-1-REVERSAL_LOOKBACK] - 1
+    result["reversal_five_day_return"] = latest / close.iloc[-6] - 1
+    result["reversal_prior_session_return"] = latest / prior - 1
+    result["reversal_prior_day_gap"] = opened.iloc[-1] / prior - 1
+    finite = np.isfinite(result.iloc[:, :4]).all(axis=1)
+    result["reversal_signal"] = (finite &
+        (result.reversal_six_month_return < 0) &
+        (result.reversal_five_day_return > 0) &
+        (result.reversal_prior_session_return > 0) &
+        (result.reversal_prior_day_gap > 0))
+    return result
+
+
+def rank_watchlist(close,volume,count=50,*,opened=None,trade_date=None,source="provided_market_data"):
     count = max(1, min(int(count), len(AI_UNIVERSE)))
     close=close.sort_index();volume=volume.reindex(close.index)
+    if trade_date is None:
+        trade_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    cutoff=pd.Timestamp(trade_date)
+    if close.index.tz is not None:
+        cutoff=cutoff.tz_localize(close.index.tz) if cutoff.tzinfo is None else cutoff.tz_convert(close.index.tz)
+    elif cutoff.tzinfo is not None:
+        cutoff=cutoff.tz_localize(None)
+    # Never rank on the proposed trade session's partial daily bar.
+    mask=close.index<cutoff
+    close=close.loc[mask];volume=volume.loc[mask]
+    if opened is not None:opened=opened.reindex(close.index)
     eligible = [ticker for ticker in close.columns
                 if close[ticker].dropna().shape[0] >= MIN_HISTORY_DAYS]
     if not eligible:
@@ -96,26 +141,48 @@ def rank_watchlist(close,volume,count=50,*,source="provided_market_data"):
     frame = _feature_frame(clean_close, volume[eligible].fillna(0))
     if frame.empty:
         raise RuntimeError("Insufficient valid market history to rank stocks")
-    frame["teddy_score"] = (0.10*_rank01(frame.momentum_1w)+0.20*_rank01(frame.momentum_1m)+
+    frame["base_score"] = (0.10*_rank01(frame.momentum_1w)+0.20*_rank01(frame.momentum_1m)+
                             0.22*_rank01(frame.momentum_3m)+0.25*_rank01(frame.momentum_6m)+
                             0.10*_rank01(frame.breakout)+0.08*_rank01(frame.relative_volume)+
                             0.05*_rank01(frame.quality))
-    picks = frame.sort_values("teddy_score", ascending=False).head(count)
+    reversal=_reversal_frame(opened.reindex(columns=eligible) if opened is not None else None,clean_close).reindex(frame.index)
+    frame=frame.join(reversal)
+    # Preserve breadth: this is a soft overlay, never an eligibility gate. Among
+    # complete four-condition matches, a six-month loss closer to zero receives
+    # the higher percentile. Nonmatches receive zero.
+    frame["reversal_overlay_score"] = 0.0
+    matched=frame.reversal_signal.fillna(False)
+    if matched.any():
+        frame.loc[matched,"reversal_overlay_score"] = frame.loc[matched,"reversal_six_month_return"].rank(pct=True)
+    frame["reversal_score_contribution"] = frame.reversal_overlay_score*REVERSAL_WEIGHT
+    frame["teddy_score"] = (1-REVERSAL_WEIGHT)*frame.base_score+frame.reversal_score_contribution
+    frame["ticker_sort"] = frame.index
+    picks = frame.sort_values(["teddy_score","ticker_sort"], ascending=[False,True]).head(count)
     positive_signal = float(frame.momentum_1m.median()) > 0
     april_gate = datetime.now(timezone.utc).month != 4 or positive_signal
     rows = [{"rank": i+1, "ticker": ticker, "category": _category_for(ticker),
              "score": round(float(row.teddy_score)*100, 2),
+             "base_score": round(float(row.base_score)*100, 4),
+             "reversal_match": bool(row.reversal_signal),
+             "reversal_overlay_score": round(float(row.reversal_overlay_score)*100, 4),
+             "reversal_score_contribution": round(float(row.reversal_score_contribution)*100, 4),
+             "reversal_metrics": {name.removeprefix("reversal_"): (round(float(row[name]), 10) if pd.notna(row[name]) else None)
+                                  for name in ("reversal_six_month_return","reversal_five_day_return","reversal_prior_session_return","reversal_prior_day_gap")},
              "weight_pct": round(100/len(picks), 6),
              "price": round(float(latest[ticker]), 6)}
             for i, (ticker, row) in enumerate(picks.iterrows())]
     return {"strategy": "V5.8 Master", "count": len(rows), "picks": rows,
             "eligible_count": len(frame), "universe_count": len(AI_UNIVERSE),
             "data_source":source,
+            "data_through": close.index[-1].date().isoformat(), "trade_date": str(pd.Timestamp(trade_date).date()),
+            "reversal_weight_pct": REVERSAL_WEIGHT*100,
+            "ranking_equation": "0.90 * V5.8 base score + 0.10 * reversal overlay percentile",
+            "reversal_rule": "negative 126-session return + positive 5-session return + positive prior session + positive prior-day gap",
             "positive_signal": positive_signal, "april_trade_allowed": april_gate,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "notice": "Broad AI, infrastructure, and medical-AI exposure themes—not pure-play claims. Alpaca paper trading only."}
 
 
 def build_watchlist(count=50):
-    close,volume=_download_universe(AI_UNIVERSE)
-    return rank_watchlist(close,volume,count,source="yfinance_research_fallback")
+    close,volume,opened=_download_universe(AI_UNIVERSE)
+    return rank_watchlist(close,volume,count,opened=opened,source="yfinance_research_fallback")

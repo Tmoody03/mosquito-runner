@@ -11,3 +11,19 @@ These are permanent, fail-closed eligibility rules for Mosquito. Momentum can ra
 7. Never voluntarily sell below the complete filled purchase cost. After a profitable sale, keep the symbol on the re-entry watch list and buy it again only after a new qualifying rise.
 
 The dashboard must expose the gate result and its evidence for selected symbols. These rules are paper-trading controls; they are not a guarantee of profit.
+
+## Isolated reversal research
+
+The prior-day reversal screen is research/shadow output only. It uses completed
+sessions strictly before the proposed trade date, caps results at 25, and cannot
+submit broker orders or replace V5.8. Its filters are: negative 126-session
+return, positive five-session return, positive prior-session return, and a
+positive gap on the prior session. Trading costs and fills must be modeled before
+interpreting any historical result; profit is not guaranteed.
+
+V5.8 ranking also applies the same completed-session equation as an auditable
+10% soft overlay. A stock receives an overlay percentile only when all four
+reversal conditions are true; qualifying six-month losses closer to zero score
+higher. Nonmatches receive zero, preserving ranking breadth. The other 90% is
+the existing V5.8 momentum/volume/quality score. The SEC fundamentals gate
+remains fail-closed after ranking and before a symbol can become paper-tradable.
