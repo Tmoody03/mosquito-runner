@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py strategy.py fundamentals.py simulator.py protection.py engine.py lifecycle.py scheduler.py ./
+COPY app.py strategy.py fundamentals.py simulator.py protection.py engine.py lifecycle.py scheduler.py five_x.py ./
 COPY templates ./templates
 COPY static ./static
 RUN useradd --create-home --uid 10001 mosquito && mkdir -p /data && chown -R mosquito:mosquito /app /data
