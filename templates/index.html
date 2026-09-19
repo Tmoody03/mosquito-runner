@@ -4,8 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#020403">
+  <meta name="application-name" content="2X Mosquito">
   <meta name="color-scheme" content="dark">
-  <title>2X Trading</title>
+  <title>2X Mosquito</title>
   <link rel="stylesheet" href="/static/style.css?v=20260916-reentry">
   <script src="/static/app.js?v=20260916-reentry" defer></script>
 </head>
@@ -21,8 +22,10 @@
    <section class="panel investment-panel">
     <div class="investment-control"><label for="investment">YOUR INVESTMENT AMOUNT</label><div class="money-input"><span>$</span><input id="investment" type="text" inputmode="decimal" autocomplete="off" placeholder="Enter amount" aria-describedby="investment-help"><button id="edit-investment" type="button" aria-label="Edit investment amount">✎</button></div><div class="slider-row"><span>$0</span><input id="investment-slider" type="range" min="0" max="100000" step="500" value="50000" aria-label="Investment amount slider"><output id="investment-slider-value" for="investment-slider">$50,000</output></div><small id="investment-help">Enter any positive amount; buying power is verified before the bot starts</small></div>
     <div class="trade-actions">
-     <button id="start-button" class="button primary" type="button"><span aria-hidden="true">▶</span> <span id="primary-label">START BOT</span></button>
-     <button id="stop-button" class="button stop" type="button">■ STOP</button>
+     <button id="buy-button" class="button buy" type="button">BUY</button>
+     <button id="sell-button" class="button sell" type="button">SELL</button>
+     <button id="start-button" class="button primary" type="button"><span aria-hidden="true">▶</span> <span id="primary-label">2X ON</span></button>
+     <button id="stop-button" class="button stop" type="button">■ 2X OFF</button>
      <button id="exit-button" class="button exit" type="button">EXIT POSITIONS</button>
      <small id="action-hint">Controls use protected server endpoints</small>
     </div>
@@ -35,10 +38,10 @@
     <article><span class="metric-icon green">▤</span><div><small>TOTAL PROFIT</small><strong id="total-profit">—</strong><p>Realized + unrealized</p></div></article>
    </section>
 
-   <section class="panel ribbon-panel" aria-label="Mosquito Green Ribbon paper portfolio">
-    <div class="ribbon-title"><div><small>GREEN RIBBON · V5.8 MASTER</small><h2 id="green-ribbon-value">—</h2></div><span id="green-ribbon-status">FORMING</span></div>
+   <section class="panel ribbon-panel" aria-label="2X daily results">
+    <div class="ribbon-title"><div><small>2X · DAILY RESULTS</small><h2 id="green-ribbon-value">—</h2></div><span id="green-ribbon-status">FORMING</span></div>
     <div class="ribbon-metrics"><div><small>STARTING VALUE</small><strong id="ribbon-starting">—</strong></div><div><small>TODAY'S P/L</small><strong id="ribbon-profit">—</strong></div><div><small>RIBBON VALUE</small><strong id="ribbon-gain">—</strong></div><div><small>END-OF-DAY VALUE</small><strong id="ribbon-eod">—</strong><p id="ribbon-asof">Waiting for completed close</p></div></div>
-    <p id="ribbon-rule" class="ribbon-rule">Paper simulation · Ribbon requires two consecutive positive daily closes</p>
+    <p id="ribbon-rule" class="ribbon-rule">2X paper trading · no daily profit cap</p>
    </section>
 
    <section class="panel profit-panel">
