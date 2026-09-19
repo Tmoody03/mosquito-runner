@@ -11,64 +11,44 @@
   <script src="/static/app.js?v=20260916-reentry" defer></script>
 </head>
 <body>
- <main class="app-shell">
-  <header class="hero" aria-labelledby="app-title">
-   <div class="hero-brand"><img class="hero-base" src="/static/mosquito-hero.webp" alt="Mosquito AI Trading Bot"><img class="hero-profit-tail" src="/static/mosquito-hero-profit.webp" alt="" aria-hidden="true"><h1 id="app-title" class="visually-hidden">Mosquito AI Trading Bot</h1></div>
-   <div class="header-actions"><div class="connection"><i id="connection-dot"></i><strong id="connection-label">CONNECTING</strong><small id="automation-label">Checking systems</small></div><button id="menu-button" class="menu-button" type="button" aria-label="Open menu" aria-expanded="false">☰</button></div>
+ <main class="app-shell compact-2x">
+  <header class="compact-head">
+   <div class="compact-brand"><img class="hero-base" src="/static/mosquito-hero.webp" alt="2X Mosquito"><img class="hero-profit-tail" src="/static/mosquito-hero-profit.webp" alt="" aria-hidden="true"></div>
+   <div><h1>2X</h1><p>AI TRADING</p><span id="connection-label">CONNECTING</span><span id="automation-label" class="visually-hidden"></span></div>
+   <div class="live-pill"><i id="connection-dot"></i><b id="bot-status">—</b></div>
   </header>
-  <section class="system-strip" aria-label="Live system connections"><strong class="paper-badge">PAPER</strong><span><i id="alpaca-dot"></i>ALPACA <b id="alpaca-status">CHECKING</b></span><span><i id="railway-dot"></i>RAILWAY <b id="railway-status">CHECKING</b></span><span><i id="engine-dot"></i>ENGINE <b id="engine-status">CHECKING</b></span><small id="engine-cycle">No engine cycle confirmed</small></section>
-
-  <section id="dashboard-view" class="view active" aria-label="Dashboard">
-   <section class="panel investment-panel">
-    <div class="investment-control"><label for="investment">YOUR INVESTMENT AMOUNT</label><div class="money-input"><span>$</span><input id="investment" type="text" inputmode="decimal" autocomplete="off" placeholder="Enter amount" aria-describedby="investment-help"><button id="edit-investment" type="button" aria-label="Edit investment amount">✎</button></div><div class="slider-row"><span>$0</span><input id="investment-slider" type="range" min="0" max="100000" step="500" value="50000" aria-label="Investment amount slider"><output id="investment-slider-value" for="investment-slider">$50,000</output></div><small id="investment-help">Enter any positive amount; buying power is verified before the bot starts</small></div>
-    <div class="trade-actions">
-     <button id="buy-button" class="button buy" type="button">BUY</button>
-     <button id="sell-button" class="button sell" type="button">SELL</button>
-     <button id="start-button" class="button primary" type="button"><span aria-hidden="true">▶</span> <span id="primary-label">2X ON</span></button>
-     <button id="stop-button" class="button stop" type="button">■ 2X OFF</button>
-     <button id="exit-button" class="button exit" type="button">EXIT POSITIONS</button>
-     <small id="action-hint">Controls use protected server endpoints</small>
-    </div>
+  <section class="system-strip compact-system"><strong class="paper-badge">PAPER</strong><span><i id="alpaca-dot"></i>ALPACA <b id="alpaca-status">—</b></span><span class="hide-compact"><i id="railway-dot"></i>RAILWAY <b id="railway-status">—</b></span><span><i id="engine-dot"></i>ENGINE <b id="engine-status">—</b></span><small id="engine-cycle" class="visually-hidden"></small><span id="menu-mode" class="visually-hidden"></span></section>
+  <section id="dashboard-view" class="view active">
+   <section class="compact-money">
+    <label for="investment">TODAY'S INVESTMENT</label>
+    <div class="money-input"><span>$</span><input id="investment" type="text" inputmode="decimal" autocomplete="off" placeholder="50,000"><button id="edit-investment" type="button" aria-label="Edit investment">✎</button></div>
+    <input id="investment-slider" class="visually-hidden" type="range" min="0" max="100000" step="500" value="50000"><output id="investment-slider-value" class="visually-hidden"></output><small id="investment-help">Set the amount before BUY or 2X ON.</small>
    </section>
-   <div id="notice" class="notice" role="status" aria-live="polite">Connecting to live services…</div>
-
-   <section class="panel metric-grid" aria-label="Account summary">
-    <article><span class="metric-icon green">$</span><div><small>INVESTMENT (CAPITAL)</small><strong id="capital">—</strong><p>Your starting amount</p></div></article>
-    <article><span class="metric-icon green">↗</span><div><small>CURRENT VALUE</small><strong id="current-value">—</strong><p>Live account value</p></div></article>
-    <article><span class="metric-icon green">▤</span><div><small>TOTAL PROFIT</small><strong id="total-profit">—</strong><p>Realized + unrealized</p></div></article>
+   <section class="quick-metrics">
+    <div><small>TODAY PROFIT</small><strong id="day-profit">—</strong><span id="day-profit-pct">—</span></div>
+    <div><small>ACCOUNT</small><strong id="current-value">—</strong><span id="total-profit">—</span></div>
+    <div><small>POSITIONS</small><strong id="positions-count">—</strong><span id="trades-count">— trades</span></div>
    </section>
-
-   <section class="panel ribbon-panel" aria-label="2X daily results">
-    <div class="ribbon-title"><div><small>2X · DAILY RESULTS</small><h2 id="green-ribbon-value">—</h2></div><span id="green-ribbon-status">FORMING</span></div>
-    <div class="ribbon-metrics"><div><small>STARTING VALUE</small><strong id="ribbon-starting">—</strong></div><div><small>TODAY'S P/L</small><strong id="ribbon-profit">—</strong></div><div><small>RIBBON VALUE</small><strong id="ribbon-gain">—</strong></div><div><small>END-OF-DAY VALUE</small><strong id="ribbon-eod">—</strong><p id="ribbon-asof">Waiting for completed close</p></div></div>
-    <p id="ribbon-rule" class="ribbon-rule">2X paper trading · no daily profit cap</p>
+   <section class="trade-actions compact-actions">
+    <button id="buy-button" class="button buy" type="button">BUY</button>
+    <button id="sell-button" class="button sell" type="button">SELL</button>
+    <button id="start-button" class="button primary" type="button"><span id="primary-label">2X ON</span></button>
+    <button id="stop-button" class="button stop" type="button">2X OFF</button>
+    <button id="exit-button" class="visually-hidden" type="button">EXIT POSITIONS</button>
+    <small id="action-hint">Protected paper controls</small>
    </section>
-
-   <section class="panel profit-panel">
-    <div class="today-profit"><small>TODAY'S PROFIT</small><strong id="day-profit">—</strong><span id="day-profit-pct">—</span></div>
-    <div class="chart-wrap"><canvas id="profit-chart" role="img" aria-label="Today's live profit chart"></canvas><p id="chart-empty">Waiting for live account history</p></div>
-    </section>
-
-   <section class="panel stats" aria-label="Trading status">
-    <article><i class="blue">▣</i><small>OPEN POSITIONS</small><strong id="positions-count">—</strong><p>Positions open</p></article>
-    <article><i class="purple">⇄</i><small>TRADES TODAY</small><strong id="trades-count">—</strong><p>Completed trades</p></article>
-    <article><i class="yellow">★</i><small>WIN RATE</small><strong id="win-rate">—</strong><p>Winning trades</p></article>
-    <article><i class="red">◇</i><small>RISK STATUS</small><strong id="risk-status">—</strong><p id="risk-detail">Checking</p></article>
-    <article><i class="cyan">●</i><small>BOT STATUS</small><strong id="bot-status">—</strong><p id="bot-detail">Checking</p></article>
+   <div id="notice" class="notice" role="status" aria-live="polite">Connecting…</div>
+   <section class="compact-picks">
+    <div class="compact-title"><h2>MORNING PICKS</h2><b id="risk-status">—</b><span id="risk-detail" class="visually-hidden"></span><span id="bot-detail" class="visually-hidden"></span><span id="capital" class="visually-hidden"></span></div>
+    <div id="positions-list" class="data-list"><p class="empty">Loading 2X picks…</p></div>
    </section>
-
-   </section>
-
-  <section id="positions-view" class="view" aria-label="Positions"><div class="panel page-panel"><h2>PICKS &amp; OPEN POSITIONS · LIVE</h2><p class="page-note">Teddy's locked Top 50 appears before fills. Alpaca paper prices refresh every 10 seconds; each pick waits for the +0.10% entry signal. After entry, Mosquito exits on a 0.05% drop from peak or immediately below the fill price.</p><div class="data-table positions-table"><div class="data-head"><span>SYMBOL</span><span>ENTRY</span><span>CURRENT</span><span>PEAK</span><span>0.05% TRIGGER</span><span>STATUS</span></div><div id="positions-list" class="data-list"><p class="empty">Teddy is selecting the Top 50</p></div></div></div></section>
-  <section id="history-view" class="view" aria-label="History"><div class="panel page-panel"><h2>COMPLETED SALES</h2><p class="page-note">Actual broker fills paired by symbol. Protected means the sell fill is at or above its matched purchase.</p><div class="data-table history-table"><div class="data-head"><span>SYMBOL</span><span>BOUGHT</span><span>SOLD</span><span>QTY</span><span>REALIZED P/L</span><span>RESULT</span></div><div id="history-list" class="data-list"><p class="empty">No completed sales reported</p></div></div></div></section>
-  <section id="performance-view" class="view" aria-label="Performance"><div class="panel page-panel"><div class="page-title-row"><h2>PERFORMANCE</h2><div id="performance-periods" class="period-tabs" role="group" aria-label="Performance period"><button class="active" data-period="1D" data-frame="5Min">DAILY</button><button data-period="1M" data-frame="1D">MONTHLY</button><button data-period="1A" data-frame="1D">ANNUAL</button></div></div><p id="performance-asof" class="page-note">Broker portfolio history · daily</p><div id="performance-list" class="data-list"><p class="empty">Waiting for performance data</p></div></div></section>
-  <section id="alerts-view" class="view" aria-label="Alerts"><div class="panel page-panel"><h2>ALERTS</h2><div id="alerts-list" class="data-list"><p class="empty">No alerts received</p></div></div></section>
-
-  <aside id="app-menu" class="app-menu" hidden><button id="menu-close" type="button" aria-label="Close menu">×</button><h2>2X</h2><p id="menu-mode">Checking trading mode…</p><a href="#dashboard-view">Dashboard</a><a href="#positions-view">Positions</a><a href="#alerts-view">Alerts</a></aside><div id="menu-scrim" class="menu-scrim" hidden></div>
-  <nav class="bottom-nav" aria-label="Main navigation">
-   <button class="active" data-view="dashboard-view"><span>⌂</span>DASHBOARD</button><button data-view="positions-view"><span>▥</span>POSITIONS</button><button data-view="history-view"><span>↶</span>HISTORY</button><button data-view="performance-view"><span>↗</span>PERFORMANCE</button><button data-view="alerts-view"><span>●</span>ALERTS<b id="alert-badge" hidden>0</b></button>
-  </nav>
-  <footer>⚡ 2X · FAST TRADES · PROTECTED PAPER MODE</footer>
+   <div class="visually-hidden">
+    <span id="green-ribbon-status"></span><span id="green-ribbon-value"></span><span id="ribbon-starting"></span><span id="ribbon-profit"></span><span id="ribbon-gain"></span><span id="ribbon-eod"></span><span id="ribbon-asof"></span><span id="ribbon-rule"></span>
+    <canvas id="profit-chart"></canvas><span id="chart-empty"></span><span id="win-rate"></span><span id="five-x-value"></span><span id="five-x-detail"></span><span id="standard-faceoff-value"></span><span id="standard-faceoff-detail"></span>
+    <div id="history-list"></div><div id="performance-list"></div><div id="alerts-list"></div><b id="alert-badge"></b><span id="performance-asof"></span><div id="performance-periods"></div>
+   </div>
+  </section>
+  <footer>2X MOSQUITO · PAPER MODE</footer>
  </main>
 </body>
 </html>
