@@ -28,3 +28,10 @@
 .compact-picks{border-top:1px solid #293137;padding-top:5px}.compact-title{display:flex;align-items:center;justify-content:space-between}.compact-title h2{margin:0;color:var(--green);font-size:14px}.compact-title b{font:800 9px system-ui}.compact-picks .data-list{max-height:190px;overflow:auto}.compact-picks .data-row{grid-template-columns:52px repeat(5,minmax(55px,1fr));gap:4px;padding:5px 2px;font-size:8px;min-width:360px}.compact-picks .empty{font-size:10px}
 .compact-2x footer{font-size:8px;margin-top:4px}.compact-2x .hero-profit-tail{clip-path:polygon(0 30%,52% 30%,52% 100%,0 100%)}
 @media(max-width:370px){.compact-head{grid-template-columns:78px 1fr auto;height:92px}.compact-brand{height:84px}.compact-head h1{font-size:42px}.compact-actions .button{min-height:44px}.compact-picks .data-list{max-height:160px}}
+
+/* 2X visual emphasis: larger mascot + stronger 2X while preserving profit throb */
+.compact-head{grid-template-columns:128px 1fr auto;height:132px;gap:4px}
+.compact-brand{height:126px;margin-left:-8px}
+.compact-head h1{font-size:64px;line-height:.76;letter-spacing:-3px;text-shadow:0 0 18px #83ef0b55}
+.compact-head p{font-size:13px;margin-top:8px}
+@media(max-width:370px){.compact-head{grid-template-columns:112px 1fr auto;height:118px}.compact-brand{height:112px}.compact-head h1{font-size:56px}}
