@@ -30,10 +30,12 @@
     <div><small>POSITIONS</small><strong id="positions-count">—</strong><span id="trades-count">— trades</span></div>
    </section>
    <section class="trade-actions compact-actions">
-    <button id="buy-button" class="button buy" type="button">BUY</button>
-    <button id="sell-button" class="button sell" type="button">SELL</button>
-    <button id="start-button" class="button primary" type="button"><span id="primary-label">2X ON</span></button>
-    <button id="stop-button" class="button stop" type="button">2X OFF</button>
+    <div class="slide-control start-slide" id="start-slide"><span class="slide-knob" id="start-knob">▶</span><b>SLIDE TO START</b></div>
+    <div class="slide-control stop-slide" id="stop-slide"><b>SLIDE TO STOP</b><span class="slide-knob" id="stop-knob">■</span></div>
+    <button id="buy-button" class="visually-hidden" type="button">START</button>
+    <button id="sell-button" class="visually-hidden" type="button">SELL</button>
+    <button id="start-button" class="visually-hidden" type="button"><span id="primary-label">2X ON</span></button>
+    <button id="stop-button" class="visually-hidden" type="button">2X OFF</button>
     <button id="exit-button" class="visually-hidden" type="button">EXIT POSITIONS</button>
     <small id="action-hint">Protected paper controls</small>
    </section>
