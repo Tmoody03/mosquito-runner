@@ -55,3 +55,12 @@
 body[data-profit="positive"] .compact-brand:after{background:rgba(78,205,30,.48);transform:scale(calc(1 + min(var(--profit-intensity,.45),1)*.16))}
 body[data-ribbon-profit="positive"] .hero-base,body[data-ribbon-profit="positive"] .hero-profit-tail{animation:none!important}
 .compact-brand .hero-profit-tail{opacity:0!important;animation:none!important;filter:none!important}
+
+/* Approved iPhone proportions: oversized mascot and visible investment slider */
+.compact-head{grid-template-columns:220px minmax(0,1fr) auto;height:194px;overflow:visible}
+.compact-brand{height:192px;margin-left:-26px;margin-right:-26px}
+.compact-brand img{width:100%;height:100%;object-fit:contain;object-position:left center}
+.compact-money .slider-row{display:grid!important;grid-template-columns:28px 1fr 72px;gap:7px;margin:5px 0 2px;align-items:center}
+.compact-money .slider-row input{display:block!important;width:100%;height:30px;accent-color:var(--green)}
+.compact-money .slider-row output{display:block!important;color:var(--green);font:800 11px system-ui;text-align:right}
+@media(max-width:390px){.compact-head{grid-template-columns:190px minmax(0,1fr) auto;height:174px}.compact-brand{height:172px;margin-left:-24px;margin-right:-22px}}
