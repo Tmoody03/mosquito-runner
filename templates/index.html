@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#020403">
   <meta name="color-scheme" content="dark">
-  <title>Mosquito AI Trading Bot</title>
+  <title>2X Trading</title>
   <link rel="stylesheet" href="/static/style.css?v=20260916-reentry">
   <script src="/static/app.js?v=20260916-reentry" defer></script>
 </head>
@@ -35,15 +35,6 @@
     <article><span class="metric-icon green">▤</span><div><small>TOTAL PROFIT</small><strong id="total-profit">—</strong><p>Realized + unrealized</p></div></article>
    </section>
 
-   <section class="panel faceoff-panel" aria-label="Standard and 5X paper comparison">
-    <div class="faceoff-title"><div><small>DAILY PAPER FACEOFF</small><h2>STANDARD vs 5X</h2></div><span>9:30 RESEARCH · 9:50 ENTRY</span></div>
-    <div class="faceoff-grid">
-     <article><small>STANDARD V5.8</small><strong id="standard-faceoff-value">—</strong><p id="standard-faceoff-detail">50-stock Alpaca paper portfolio</p></article>
-     <article><small>5X CANDIDATE MODEL</small><strong id="five-x-value">—</strong><p id="five-x-detail">Independent virtual-paper portfolio</p></article>
-    </div>
-    <p class="faceoff-warning">5X is a speculative 12-month research target, not a guaranteed return. The portfolios are isolated so overlapping symbols cannot corrupt results.</p>
-   </section>
-
    <section class="panel ribbon-panel" aria-label="Mosquito Green Ribbon paper portfolio">
     <div class="ribbon-title"><div><small>GREEN RIBBON · V5.8 MASTER</small><h2 id="green-ribbon-value">—</h2></div><span id="green-ribbon-status">FORMING</span></div>
     <div class="ribbon-metrics"><div><small>STARTING VALUE</small><strong id="ribbon-starting">—</strong></div><div><small>TODAY'S P/L</small><strong id="ribbon-profit">—</strong></div><div><small>RIBBON VALUE</small><strong id="ribbon-gain">—</strong></div><div><small>END-OF-DAY VALUE</small><strong id="ribbon-eod">—</strong><p id="ribbon-asof">Waiting for completed close</p></div></div>
@@ -53,8 +44,7 @@
    <section class="panel profit-panel">
     <div class="today-profit"><small>TODAY'S PROFIT</small><strong id="day-profit">—</strong><span id="day-profit-pct">—</span></div>
     <div class="chart-wrap"><canvas id="profit-chart" role="img" aria-label="Today's live profit chart"></canvas><p id="chart-empty">Waiting for live account history</p></div>
-    <div class="goal-ring"><small>TODAY'S GOAL</small><strong id="daily-goal">—</strong><div id="goal-ring" class="ring"><span id="goal-percent">—</span></div><p id="goal-status">Not available</p></div>
-   </section>
+    </section>
 
    <section class="panel stats" aria-label="Trading status">
     <article><i class="blue">▣</i><small>OPEN POSITIONS</small><strong id="positions-count">—</strong><p>Positions open</p></article>
@@ -64,21 +54,18 @@
     <article><i class="cyan">●</i><small>BOT STATUS</small><strong id="bot-status">—</strong><p id="bot-detail">Checking</p></article>
    </section>
 
-   <section class="panel goal-progress">
-    <div><h2>DAILY PROFIT GOAL</h2><strong id="goal-value">—</strong></div><div class="track"><span id="goal-bar"></span><i id="goal-marker" aria-hidden="true"></i></div><div class="track-labels"><span>$0</span><span id="goal-mid">Goal unavailable</span></div>
    </section>
-  </section>
 
   <section id="positions-view" class="view" aria-label="Positions"><div class="panel page-panel"><h2>PICKS &amp; OPEN POSITIONS · LIVE</h2><p class="page-note">Teddy's locked Top 50 appears before fills. Alpaca paper prices refresh every 10 seconds; each pick waits for the +0.10% entry signal. After entry, Mosquito exits on a 0.05% drop from peak or immediately below the fill price.</p><div class="data-table positions-table"><div class="data-head"><span>SYMBOL</span><span>ENTRY</span><span>CURRENT</span><span>PEAK</span><span>0.05% TRIGGER</span><span>STATUS</span></div><div id="positions-list" class="data-list"><p class="empty">Teddy is selecting the Top 50</p></div></div></div></section>
   <section id="history-view" class="view" aria-label="History"><div class="panel page-panel"><h2>COMPLETED SALES</h2><p class="page-note">Actual broker fills paired by symbol. Protected means the sell fill is at or above its matched purchase.</p><div class="data-table history-table"><div class="data-head"><span>SYMBOL</span><span>BOUGHT</span><span>SOLD</span><span>QTY</span><span>REALIZED P/L</span><span>RESULT</span></div><div id="history-list" class="data-list"><p class="empty">No completed sales reported</p></div></div></div></section>
   <section id="performance-view" class="view" aria-label="Performance"><div class="panel page-panel"><div class="page-title-row"><h2>PERFORMANCE</h2><div id="performance-periods" class="period-tabs" role="group" aria-label="Performance period"><button class="active" data-period="1D" data-frame="5Min">DAILY</button><button data-period="1M" data-frame="1D">MONTHLY</button><button data-period="1A" data-frame="1D">ANNUAL</button></div></div><p id="performance-asof" class="page-note">Broker portfolio history · daily</p><div id="performance-list" class="data-list"><p class="empty">Waiting for performance data</p></div></div></section>
   <section id="alerts-view" class="view" aria-label="Alerts"><div class="panel page-panel"><h2>ALERTS</h2><div id="alerts-list" class="data-list"><p class="empty">No alerts received</p></div></div></section>
 
-  <aside id="app-menu" class="app-menu" hidden><button id="menu-close" type="button" aria-label="Close menu">×</button><h2>MOSQUITO</h2><p id="menu-mode">Checking trading mode…</p><a href="#dashboard-view">Dashboard</a><a href="#positions-view">Positions</a><a href="#alerts-view">Alerts</a></aside><div id="menu-scrim" class="menu-scrim" hidden></div>
+  <aside id="app-menu" class="app-menu" hidden><button id="menu-close" type="button" aria-label="Close menu">×</button><h2>2X</h2><p id="menu-mode">Checking trading mode…</p><a href="#dashboard-view">Dashboard</a><a href="#positions-view">Positions</a><a href="#alerts-view">Alerts</a></aside><div id="menu-scrim" class="menu-scrim" hidden></div>
   <nav class="bottom-nav" aria-label="Main navigation">
    <button class="active" data-view="dashboard-view"><span>⌂</span>DASHBOARD</button><button data-view="positions-view"><span>▥</span>POSITIONS</button><button data-view="history-view"><span>↶</span>HISTORY</button><button data-view="performance-view"><span>↗</span>PERFORMANCE</button><button data-view="alerts-view"><span>●</span>ALERTS<b id="alert-badge" hidden>0</b></button>
   </nav>
-  <footer>⚡ LIVE DATA · PROTECTED CONTROLS · PAPER MODE BY DEFAULT</footer>
+  <footer>⚡ 2X · FAST TRADES · PROTECTED PAPER MODE</footer>
  </main>
 </body>
 </html>
