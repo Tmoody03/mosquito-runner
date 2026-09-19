@@ -35,3 +35,9 @@
 .compact-head h1{font-size:64px;line-height:.76;letter-spacing:-3px;text-shadow:0 0 18px #83ef0b55}
 .compact-head p{font-size:13px;margin-top:8px}
 @media(max-width:370px){.compact-head{grid-template-columns:112px 1fr auto;height:118px}.compact-brand{height:112px}.compact-head h1{font-size:56px}}
+
+/* Bigger mascot revision */
+.compact-head{grid-template-columns:168px 1fr auto;height:160px}
+.compact-brand{height:158px;margin-left:-16px;margin-right:-8px}
+.compact-brand .hero-base,.compact-brand .hero-profit-tail{transform-origin:42% 58%}
+@media(max-width:370px){.compact-head{grid-template-columns:145px 1fr auto;height:142px}.compact-brand{height:140px;margin-left:-14px}.compact-head h1{font-size:52px}}
