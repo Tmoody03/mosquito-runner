@@ -49,3 +49,9 @@
 .compact-head h1{font-size:70px;line-height:.72;letter-spacing:-4px}
 .compact-head p{font-size:14px;white-space:nowrap}
 @media(max-width:390px){.compact-head{grid-template-columns:178px 1fr auto;height:165px}.compact-brand{height:162px;margin-left:-20px;margin-right:-15px}.compact-head h1{font-size:60px}}
+
+/* 2X belly state: red at start, green only after positive daily P/L; no red backlight */
+.compact-brand:after{content:"";position:absolute;left:15%;bottom:18%;width:46%;height:34%;border-radius:50%;background:rgba(205,25,25,.42);filter:none;z-index:-1;transition:background .35s,transform .35s}
+body[data-profit="positive"] .compact-brand:after{background:rgba(78,205,30,.48);transform:scale(calc(1 + min(var(--profit-intensity,.45),1)*.16))}
+body[data-ribbon-profit="positive"] .hero-base,body[data-ribbon-profit="positive"] .hero-profit-tail{animation:none!important}
+.compact-brand .hero-profit-tail{opacity:0!important;animation:none!important;filter:none!important}
